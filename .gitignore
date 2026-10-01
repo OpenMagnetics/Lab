@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# KiCad per-user / cache / backups
+*.kicad_prl
+fp-info-cache
+*_backup_*.kicad_pcb
+*.bak
+logs/
+logs_*.txt
+
+# Vendored third-party tooling (freerouting + JRE, review skills)
+tools/
+
+# Measurement output / cache
+scripts/output/
+
+# Local Claude Code settings
+.claude/

@@ -1,4 +1,11 @@
 pyvisa
 pyvisa-py
+pyserial
 zeroconf
 matplotlib
+scipy
+pandas
+numpy
+trimesh
+manifold3d
+rtree

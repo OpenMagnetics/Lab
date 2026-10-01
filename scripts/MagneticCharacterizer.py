@@ -1,908 +1,560 @@
-import Bode100Analyzer
-import pyvisa
-import ast
-import pathlib
-import os
-import pandas
+"""
+Automated small-signal characterization of a two-winding magnetic.
+
+Drives the Bode 100 and the relay board to extract the full [COG94] Fig. 1
+equivalent circuit: coupling, magnetizing and leakage inductance, winding and
+core loss resistances, and the six capacitance coefficients of [BLA94].
+
+    characterizer = MagneticCharacterizer("my_transformer")
+    results = characterizer.characterize_all()
+
+Every raw sweep is cached to output/{reference}_{config}_{kind}.csv, so any
+analysis change can be re-run with allow_use_cache=True and no instruments
+connected.  The extraction maths lives in TransformerModel and is unit-tested
+independently (python test_model.py).
+"""
+
+import argparse
+import json
 import math
-import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
-from scipy.optimize import fsolve, least_squares
+import os
+import pathlib
+
 import numpy
+import pandas
+
+import Bode100Analyzer
+import RelayBoardController as rbc
+import TransformerModel as tm
 
 
 class MagneticCharacterizer:
-    def  __init__(self, reference="temp"):
+
+    #: Inductance band. Starts low enough to reach the resistive plateau that
+    #: [COG94] II-C reads r1 and r2 from -- rev A started at 10 kHz, which for
+    #: most magnetics is already inductive, so those resistances were
+    #: unreachable.
+    INDUCTANCE_BAND = (100.0, 1_000_000.0)
+
+    #: Resonance band for the capacitance work.
+    RESONANCE_BAND = (10_000.0, 40_000_000.0)
+
+    #: [COG94] III: lower drive at low frequency to avoid core saturation,
+    #: higher at high frequency for signal-to-noise. Rev A used a fixed 13 dBm
+    #: everywhere, which is wrong at both ends of a 100 Hz - 40 MHz sweep.
+    DRIVE_LOW_BAND_DBM = 0
+    DRIVE_HIGH_BAND_DBM = 13
+
+    def __init__(self, reference="temp", relay_board_port=None, bode_ip=None,
+                 auto_calibrate=True):
         self.reference = reference
-        self.bode_100 = Bode100Analyzer.MagneticMeasurer()
-        self.bode_100.calibrate(f"{pathlib.Path(__file__).parent.resolve()}\\calibrations\\isi_board.mcalx")
+        self.auto_calibrate = auto_calibrate
 
-        self.output_path = pathlib.Path(__file__).parent.resolve() / "output"
-        pathlib.Path(self.output_path).mkdir(parents=True, exist_ok=True)
+        here = pathlib.Path(__file__).parent.resolve()
+        self.calibrations_path = here / "calibrations"
+        self.output_path = here / "output"
+        self.calibrations_path.mkdir(parents=True, exist_ok=True)
+        self.output_path.mkdir(parents=True, exist_ok=True)
 
-    def extract_value_at_frequency(self, data, frequency, parameter="inductance"):
-        closest_frequency = None
-        closest_value = None
-        minimum_error = 100
-        for _, row in data.iterrows():
-            error = abs(row["frequency"] - frequency) / frequency
-            if error < minimum_error:
-                closest_frequency = row["frequency"]
-                closest_value = row[parameter]
-                minimum_error = error
-                if error == 0:
-                    break
+        self.bode_100 = None
+        self.relay_board = None
+        self.offline = False
+        self.results = {}
+        self.warnings = []
 
-        return (closest_frequency, closest_value)
+        try:
+            kwargs = {"SCPI_server_IP": bode_ip} if bode_ip else {}
+            self.bode_100 = Bode100Analyzer.MagneticMeasurer(**kwargs)
+            self.relay_board = rbc.RelayBoardController(com_port=relay_board_port)
+            self.relay_board.reset()
+        except Exception as error:
+            self.offline = True
+            print(f"\n*** No instruments ({type(error).__name__}: {error})")
+            print("*** Running OFFLINE -- cached CSVs only, allow_use_cache must be True.\n")
 
-    def average_measurements(self, data):
-        grouped = data.groupby(['frequency'], as_index=False)
-        print(grouped)
-        averaged_measurements = grouped.mean()
-        print(averaged_measurements)
-        return averaged_measurements
+    # ------------------------------------------------------------ warnings
 
-    def detect_zero_crossing(self, data):
-        data = self.average_measurements(data)
-        resonances = []
-        phase_slopes = []
+    def warn(self, message):
+        self.warnings.append(message)
+        print(f"  !! {message}")
 
+    # --------------------------------------------------------- acquisition
 
-        peak_indexes, properties = find_peaks(data["magnitude"], prominence=2)
-        for index in peak_indexes:
-            resonances.append({"frequency": data.loc[index, "frequency"], "impedance_magnitude": data.loc[index, "magnitude"], "type": "local maximum"})
+    def _cache_path(self, config_number, kind):
+        name = rbc.CONFIGS[config_number]["name"]
+        return self.output_path / f"{self.reference}_cfg{config_number:02d}_{name}_{kind}.csv"
 
-        peak_indexes, properties = find_peaks(-data["magnitude"], prominence=2)
-        for index in peak_indexes:
-            resonances.append({"frequency": data.loc[index, "frequency"], "impedance_magnitude": data.loc[index, "magnitude"], "type": "local minimum"})
+    def _set_config(self, config_number):
+        """Switch, then make sure the calibration matches THIS relay state.
 
-        resonances = sorted(resonances, key=lambda resonance: resonance["frequency"])
+        Rev A grouped many configurations onto one calibration, so relays inside
+        a group changed the fixture between calibrating and measuring. With
+        on-board standards every configuration can own its calibration, so it
+        does.
+        """
+        config = self.relay_board.set_config(config_number)
+        if self.auto_calibrate:
+            self._ensure_calibrated(config_number)
+        return config
 
-        return resonances
+    def _ensure_calibrated(self, config_number):
+        calibration_file = str(self.calibrations_path / self.relay_board.calibration_name(config_number))
+        path = rbc.signal_path(rbc.CONFIGS[config_number])
 
+        if os.path.exists(calibration_file):
+            self.bode_100.calibrate(calibration_file, calibration_group=path)
+            return
 
-    def characterize_inductance(self):
-        input("Place secondary in open circuit, setup primary up for measurement and press Enter to continue...")
-        data_Lp_OS = self.bode_100.take_Rs_Ls_measurement(
-            start_frequency=10000,
-            stop_frequency=1000000,
-            number_of_measurement_cycles=2
-        )
+        print(f"  Calibrating path {path} (automatic, DUT stays clamped)")
+        self.bode_100.visa_session.write(f":SENS:CORR:LOAD {rbc.CALIBRATION_LOAD_OHM}")
+        self.bode_100.visa_session.write(":CALC:ZPAR:DEF Z")
+        for mode, command in (("OPEN", ":SENS:CORR:FULL:OPEN"),
+                              ("SHORT", ":SENS:CORR:FULL:SHOR"),
+                              ("LOAD", ":SENS:CORR:FULL:LOAD")):
+            self.relay_board.set_calibration_mode(mode)
+            self.bode_100.visa_session.write(command)
+            self.bode_100.visa_session.write("*WAI")
+            self.bode_100.visa_session.query("*OPC?")
+            print(f"    {mode} standard applied")
+        self.relay_board.set_calibration_mode("MEAS")
 
-        input("Place primary in open circuit, setup secondary up for measurement and press Enter to continue...")
-        data_Ls_OP = self.bode_100.take_Rs_Ls_measurement(
-            start_frequency=10000,
-            stop_frequency=1000000,
-            number_of_measurement_cycles=2
-        )
+        if not self.bode_100.is_calibrated():
+            raise RuntimeError(f"Automatic OSL failed for path {path}")
+        self.bode_100.visa_session.write(f':MMEM:STOR:CORR "{calibration_file}"')
+        self.bode_100.current_calibration_group = path
+        self.bode_100.current_calibration_file = calibration_file
+        print(f"    stored {os.path.basename(calibration_file)}")
 
-        input("Place circuit in cummulative flux mode and press Enter to continue...")
-        data_Lcum = self.bode_100.take_Rs_Ls_measurement(
-            start_frequency=10000,
-            stop_frequency=1000000,
-            number_of_measurement_cycles=2
-        )
-
-        input("Place circuit in differential flux mode and press Enter to continue...")
-        data_Ldif = self.bode_100.take_Rs_Ls_measurement(
-            start_frequency=10000,
-            stop_frequency=1000000,
-            number_of_measurement_cycles=2
-        )
-
-    def characterize_inductance_basic(self, allow_use_cache=False):
-        magnetizing_inductance_filepath  = self.output_path / f"{self.reference}_basic_inductance_characterization_magnetizing_inductance.csv"
-        leakage_inductance_filepath  = self.output_path / f"{self.reference}_basic_inductance_characterization_leakage_inductance.csv"
-
-
-        if allow_use_cache and os.path.exists(magnetizing_inductance_filepath):
-            magnetizing_inductance = pandas.read_csv(magnetizing_inductance_filepath)
-        else:
-            input("Place secondary in open circuit, setup primary up for measurement and press Enter to continue...")
-            data_Lp_OS = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=1000000,
-                number_of_measurement_cycles=2
+    def measure(self, config_number, kind="RL", allow_use_cache=False, band=None,
+                cycles=2, points=201, drive_dbm=None):
+        """Acquire (or load) one sweep. kind is 'RL', 'Z' or 'Cs'."""
+        path = self._cache_path(config_number, kind)
+        if allow_use_cache and path.exists():
+            return pandas.read_csv(path)
+        if self.offline:
+            raise RuntimeError(
+                f"Offline and no cached sweep at {path.name}. Connect the "
+                "instruments, or run a configuration whose CSVs already exist."
             )
-            magnetizing_inductance = data_Lp_OS
-            magnetizing_inductance.to_csv(magnetizing_inductance_filepath, index=False)
 
-        if allow_use_cache and os.path.exists(leakage_inductance_filepath):
-            leakage_inductance = pandas.read_csv(leakage_inductance_filepath)
-        else:
-            input("Place secondary in short circuit, setup primary up for measurement and press Enter to continue...")
-            data_Lp_SS = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=1000000,
-                number_of_measurement_cycles=2
+        start, stop = band or (self.INDUCTANCE_BAND if kind == "RL" else self.RESONANCE_BAND)
+        if drive_dbm is None:
+            drive_dbm = self.DRIVE_LOW_BAND_DBM if start < 1000 else self.DRIVE_HIGH_BAND_DBM
+
+        self._set_config(config_number)
+        method = {"RL": self.bode_100.take_Rs_Ls_measurement,
+                  "Z": self.bode_100.take_Z_phase_measurement,
+                  "Cs": self.bode_100.take_Cs_measurement}[kind]
+        data = method(start_frequency=start, stop_frequency=stop,
+                      number_of_measurement_cycles=cycles,
+                      number_of_measurement_points=points,
+                      source_power_dbm=drive_dbm)
+        data.to_csv(path, index=False)
+        return data
+
+    def value_at(self, data, frequency, parameter="inductance", tolerance=0.05):
+        """Value at a frequency, refusing to silently return a far-off point.
+
+        Rev A seeded its search at a relative error of 100 and never checked
+        afterwards, so asking for 100 Hz on a sweep starting at 10 kHz returned
+        the 10 kHz point into a variable named for 100 Hz.
+        """
+        averaged = tm.average_cycles(data)
+        errors = (averaged["frequency"] - frequency).abs() / frequency
+        index = errors.idxmin()
+        if errors[index] > tolerance:
+            available = averaged["frequency"]
+            raise ValueError(
+                f"No point within {tolerance*100:.0f}% of {frequency:g} Hz. "
+                f"Sweep covers {available.min():g}..{available.max():g} Hz; "
+                f"nearest is {available[index]:g} Hz."
             )
-            leakage_inductance = data_Lp_SS
-            leakage_inductance.to_csv(leakage_inductance_filepath, index=False)
+        return float(averaged.loc[index, "frequency"]), float(averaged.loc[index, parameter])
 
-        measured_frequency, magnetizing_inductance_at_10kHz = self.extract_value_at_frequency(magnetizing_inductance, 10000)
-        print(f"magnetizing_inductance_at_10kHz : {magnetizing_inductance_at_10kHz}")
-        measured_frequency, leakage_inductance_10kHz = self.extract_value_at_frequency(leakage_inductance, 10000)
-        print(f"leakage_inductance_10kHz : {leakage_inductance_10kHz}")
+    # ------------------------------------------------------- verification
 
-        self.bode_100.plot_RL(
-            data=magnetizing_inductance,
-            plot_resistance=False,
-            resistance_label="Resistance",
-            plot_inductance=True,
-            inductance_label="Magnetizing Inductance"
-        )
+    def verify_switching(self, allow_use_cache=False):
+        """[BLA94] II-C: Z0*Zsc' = Z0'*Zsc for any linear two-port.
 
-        self.bode_100.plot_RL(
-            data=leakage_inductance,
-            plot_resistance=False,
-            resistance_label="Resistance",
-            plot_inductance=True,
-            inductance_label="Leakage Inductance"
-        )
-
-    def characterize_inductance_medium(self, allow_use_cache=False):
-        data_Lp_OS_filepath  = self.output_path / f"{self.reference}_medium_inductance_characterization_data_Lp_OS.csv"
-        data_Lp_SS_filepath  = self.output_path / f"{self.reference}_medium_inductance_characterization_data_Lp_SS.csv"
-
-        if allow_use_cache and os.path.exists(data_Lp_OS_filepath):
-            data_Lp_OS = pandas.read_csv(data_Lp_OS_filepath)
+        An end-to-end check that the relay matrix produced the four topologies
+        the script asked for -- no reference standard needed, checkable at every
+        frequency. The dominant failure mode of a switched fixture is a relay
+        silently in the wrong state returning a plausible sweep; this catches it.
+        """
+        print("\n-- Switching self-test (reciprocity) --")
+        sweeps = {name: self.measure(number, "Z", allow_use_cache, band=self.RESONANCE_BAND)
+                  for name, number in (("Z0", 1), ("Zsc", 2), ("Z0p", 3), ("Zscp", 4))}
+        passed, worst, _ = tm.check_reciprocity(sweeps["Z0"], sweeps["Z0p"],
+                                                sweeps["Zsc"], sweeps["Zscp"])
+        self.results["reciprocity_error"] = worst
+        self.results["reciprocity_passed"] = passed
+        if passed:
+            print(f"  PASS -- worst deviation {worst*100:.2f}%")
         else:
-            input("Place secondary in open circuit, setup primary up for measurement and press Enter to continue...")
-            data_Lp_OS = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=1000000,
-                number_of_measurement_cycles=2
-            )
-            measured_frequency, data_Lp_OS_at_10kHz = self.extract_value_at_frequency(data_Lp_OS, 10000)
-            print(data_Lp_OS_at_10kHz)
-            data_Lp_OS.to_csv(data_Lp_OS_filepath, index=False)
+            self.warn(f"RECIPROCITY FAILED ({worst*100:.1f}%): a relay is probably in the "
+                      "wrong state, or the DUT is non-linear. Results below are suspect.")
+        return passed
 
-        if allow_use_cache and os.path.exists(data_Lp_SS_filepath):
-            data_Lp_SS = pandas.read_csv(data_Lp_SS_filepath)
+    def verify_linearity(self, config_number=1, allow_use_cache=False):
+        """[COG94] III: acquire twice at two drive levels to prove linearity."""
+        print("\n-- Linearity check --")
+        low = self._cache_path(config_number, "RL_drive_low")
+        high = self._cache_path(config_number, "RL_drive_high")
+        if allow_use_cache and low.exists() and high.exists():
+            low_data, high_data = pandas.read_csv(low), pandas.read_csv(high)
+        elif self.offline:
+            print("  skipped (offline, no cached drive sweeps)")
+            return None
         else:
-            input("Place secondary in short circuit, setup primary up for measurement and press Enter to continue...")
-            data_Lp_SS = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=1000000,
-                number_of_measurement_cycles=2
-            )
-            measured_frequency, data_Lp_SS_at_10kHz = self.extract_value_at_frequency(data_Lp_SS, 10000)
-            print(data_Lp_SS_at_10kHz)
-            data_Lp_SS.to_csv(data_Lp_SS_filepath, index=False)
+            self._set_config(config_number)
+            low_data = self.bode_100.take_Rs_Ls_measurement(
+                *self.INDUCTANCE_BAND, number_of_measurement_cycles=1, source_power_dbm=-10)
+            low_data.to_csv(low, index=False)
+            high_data = self.bode_100.take_Rs_Ls_measurement(
+                *self.INDUCTANCE_BAND, number_of_measurement_cycles=1, source_power_dbm=10)
+            high_data.to_csv(high, index=False)
 
-        temp_data = data_Lp_OS[["frequency"]].copy()
-        temp_data["Lp_OS"] = data_Lp_OS["inductance"]
-        temp_data["Lp_SS"] = data_Lp_SS["inductance"]
-
-        temp_data["coupling_coefficient"] = temp_data.apply(lambda row: math.sqrt(1 - row["Lp_SS"] / row["Lp_OS"]), axis=1)
-        temp_data["leakage_inductance"] = temp_data.apply(lambda row: row["Lp_SS"] / row["coupling_coefficient"], axis=1)
-        temp_data["magnetizing_inductance"] = temp_data.apply(lambda row: row["Lp_OS"] * (1 + row["coupling_coefficient"]) / 2, axis=1)
-        measured_frequency, leakage_inductance_at_10kHz = self.extract_value_at_frequency(temp_data, 10000, parameter="leakage_inductance")
-        measured_frequency, magnetizing_inductance_at_10kHz = self.extract_value_at_frequency(temp_data, 10000, parameter="magnetizing_inductance")
-        print(leakage_inductance_at_10kHz)
-        print(magnetizing_inductance_at_10kHz)
-
-        self.bode_100.plot(
-            data=temp_data,
-            column="magnetizing_inductance",
-            label="Magnetizing Inductance",
-        )
-        self.bode_100.plot(
-            data=temp_data,
-            column="leakage_inductance",
-            label="Leakage Inductance",
-        )
-
-    def characterize_inductance_advanced(self, allow_use_cache=False):
-        data_Lp_OS_filepath  = self.output_path / f"{self.reference}_advanced_inductance_characterization_data_Lp_OS.csv"
-        data_Ls_OP_filepath  = self.output_path / f"{self.reference}_advanced_inductance_characterization_data_Ls_OP.csv"
-        data_Lp_SS_filepath  = self.output_path / f"{self.reference}_advanced_inductance_characterization_data_Lp_SS.csv"
-        data_Lcum_filepath  = self.output_path / f"{self.reference}_advanced_inductance_characterization_data_Lcum.csv"
-        data_Ldif_filepath  = self.output_path / f"{self.reference}_advanced_inductance_characterization_data_Ldif.csv"
-
-        magnetizing_inductance_filepath  = self.output_path / f"{self.reference}_advanced_inductance_characterization_magnetizing_inductance.csv"
-        leakage_inductance_filepath  = self.output_path / f"{self.reference}_advanced_inductance_characterization_leakage_inductance.csv"
-        coupling_coefficient_filepath  = self.output_path / f"{self.reference}_advanced_inductance_characterization_coupling_coefficient.csv"
-
-        if allow_use_cache and os.path.exists(data_Lp_OS_filepath):
-            data_Lp_OS = pandas.read_csv(data_Lp_OS_filepath)
+        passed, worst, _ = tm.check_linearity(low_data, high_data)
+        self.results["linearity_deviation"] = worst
+        if passed:
+            print(f"  PASS -- inductance moves {worst*100:.2f}% over a 20 dB drive change")
         else:
-            input("Place secondary in open circuit, setup primary up for measurement and press Enter to continue...")
-            data_Lp_OS = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=1000000,
-                number_of_measurement_cycles=2
-            )
-            measured_frequency, data_Lp_OS_at_10kHz = self.extract_value_at_frequency(data_Lp_OS, 10000)
-            print(data_Lp_OS_at_10kHz)
-            data_Lp_OS.to_csv(data_Lp_OS_filepath, index=False)
+            self.warn(f"NON-LINEAR ({worst*100:.1f}% inductance change over 20 dB). The "
+                      "six-capacitance model assumes linearity; lower the drive.")
+        return passed
 
-        if allow_use_cache and os.path.exists(data_Lp_SS_filepath):
-            data_Lp_SS = pandas.read_csv(data_Lp_SS_filepath)
+    # -------------------------------------------------- magnetic parameters
+
+    def characterize_inductance(self, allow_use_cache=False):
+        """[COG94] II-B: k, eta, Lp and ls from three (here five) sweeps."""
+        print("\n-- Inductance and coupling --")
+        sweeps = {name: self.measure(number, "RL", allow_use_cache)
+                  for name, number in (("Z0", 1), ("Zsc", 2), ("Z0p", 3),
+                                       ("Lcum", 5), ("Ldif", 6))}
+
+        # [COG94] reads inductance off "the first ascending part" of the Bode
+        # plot. Above that, self-capacitance inflates L by 1/(1-(f/fr)^2), so
+        # the reference frequency is chosen from the measured resonance rather
+        # than fixed at 10 kHz.
+        reference_frequency = 10_000.0
+        first_resonance = None
+        try:
+            resonances = tm.detect_resonances(
+                self.measure(1, "Z", allow_use_cache, band=self.RESONANCE_BAND))
+            maxima = [r["frequency"] for r in resonances if r["type"] == "local maximum"]
+            first_resonance = min(maxima) if maxima else None
+            reference_frequency = tm.safe_reference_frequency(
+                resonances, preferred=10_000.0,
+                available=tm.average_cycles(sweeps["Z0"])["frequency"])
+        except Exception as error:
+            self.warn(f"Could not locate the first resonance ({error}); "
+                      "using a fixed 10 kHz reference frequency.")
+
+        lift = tm.inductance_lift(reference_frequency, first_resonance)
+        print(f"  reference frequency {reference_frequency:.0f} Hz"
+              + (f" (resonance {first_resonance/1e3:.1f} kHz, "
+                 f"inductance over-read {lift*100:.3f}%)" if first_resonance else ""))
+        if lift > 0.01:
+            self.warn(f"At {reference_frequency:.0f} Hz self-capacitance inflates the "
+                      f"inductances by {lift*100:.1f}%. Start the RL sweep lower.")
+
+        values = {}
+        for name, data in sweeps.items():
+            _, values[name] = self.value_at(data, reference_frequency, "inductance")
+
+        summary = tm.magnetic_summary(
+            L0=values["Z0"], Lsc=values["Zsc"], L0_prime=values["Z0p"],
+            L_cum=values["Lcum"], L_dif=values["Ldif"])
+        summary["reference_frequency"] = reference_frequency
+
+        if summary.get("dot_convention_swapped"):
+            self.warn("Series-aiding and series-opposing came back swapped -- the "
+                      "secondary is clamped reversed. Corrected automatically.")
+        consistency = summary.get("k_consistency")
+        if consistency is not None and consistency > 0.05:
+            self.warn(f"k from Lsc and k from mutual inductance disagree by "
+                      f"{consistency*100:.1f}%; coupling may be too loose for the "
+                      "strong-coupling approximations of [COG94].")
+
+        print(f"  k    = {summary['k']:.5f}")
+        print(f"  eta  = {summary['eta']:.5f}   (N2/N1 = {summary['turns_ratio_N2_N1']:.5f})")
+        print(f"  Lp   = {summary['Lp_magnetizing']*1e6:.3f} uH   [COG94] eq (5), L0(1+k)/2")
+        print(f"  ls   = {summary['ls_leakage']*1e6:.3f} uH   [COG94] eq (4), Lsc/k")
+        self.results["magnetic"] = summary
+        return summary
+
+    def characterize_resistances(self, allow_use_cache=False):
+        """[COG94] II-C: r1, r2 from the LF plateaus, Rp at parallel resonance."""
+        print("\n-- Losses --")
+        eta = self.results.get("magnetic", {}).get("eta")
+        if eta is None:
+            eta = self.characterize_inductance(allow_use_cache)["eta"]
+
+        Z0_rl = self.measure(1, "RL", allow_use_cache)
+        Z0p_rl = self.measure(3, "RL", allow_use_cache)
+
+        # [COG94] II-C: "The low-frequency plateau of Z0 equals r1, and that of
+        # Z0' equals eta^2*r2."  So the plateau of Z0' IS the physical secondary
+        # winding resistance -- what a DC ohmmeter on the secondary reads -- and
+        # dividing by eta^2 gives r2 as it appears in the equivalent circuit,
+        # referred to the primary.  Report both; they differ by eta^2 and
+        # confusing them is a factor-of-eta^2 error.
+        r1, f1, flat1 = tm.winding_resistance_from_plateau(Z0_rl, max_frequency=5000)
+        r2_secondary, f2, flat2 = tm.winding_resistance_from_plateau(Z0p_rl, max_frequency=5000)
+        r2_circuit = r2_secondary / eta ** 2
+
+        for name, flatness in (("r1", flat1), ("r2", flat2)):
+            if flatness > 0.1:
+                self.warn(f"{name}: the sweep never flattened (spread {flatness*100:.0f}%); "
+                          "start lower than 100 Hz or treat this as an upper bound.")
+
+        Z0_z = self.measure(1, "Z", allow_use_cache, band=self.RESONANCE_BAND)
+        resonances = tm.detect_resonances(Z0_z)
+        maxima = [r for r in resonances if r["type"] == "local maximum"]
+        Rp = None
+        if maxima:
+            Rp, at_frequency = tm.core_loss_resistance(Z0_z, maxima[0]["frequency"])
+            print(f"  Rp   = {Rp:.1f} ohm      at {at_frequency/1e3:.1f} kHz  [COG94] II-C")
         else:
-            input("Place secondary in short circuit, setup primary up for measurement and press Enter to continue...")
-            data_Lp_SS = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=1000000,
-                number_of_measurement_cycles=2
-            )
-            measured_frequency, data_Lp_SS_at_10kHz = self.extract_value_at_frequency(data_Lp_SS, 10000)
-            print(data_Lp_SS_at_10kHz)
-            data_Lp_SS.to_csv(data_Lp_SS_filepath, index=False)
+            self.warn("No parallel resonance found in Z0, so Rp (core loss) is unavailable. "
+                      "Widen the sweep above the self-resonant frequency.")
 
-        if allow_use_cache and os.path.exists(data_Ls_OP_filepath):
-            data_Ls_OP = pandas.read_csv(data_Ls_OP_filepath)
+        print(f"  r1   = {r1*1e3:.2f} mohm   primary winding (plateau to {f1:.0f} Hz)")
+        print(f"  r2   = {r2_secondary*1e3:.2f} mohm   secondary winding, as measured")
+        print(f"         {r2_circuit*1e3:.2f} mohm   the same, referred to the primary "
+              f"(/{eta**2:.3f})")
+        self.warn("r1/r2 include the fixture: one isolation-relay contact plus clamp "
+                  "wiring sit outside the calibration plane (order 100 mohm).")
+
+        losses = {"r1": r1, "r2_secondary": r2_secondary, "r2_primary_referred": r2_circuit,
+                  "Rp": Rp, "r1_plateau_flatness": flat1, "r2_plateau_flatness": flat2}
+        self.results["losses"] = losses
+        return losses
+
+    def characterize_capacitance(self, allow_use_cache=False):
+        """[BLA94] Table 1: the six capacitance coefficients from resonances."""
+        print("\n-- Capacitances --")
+        magnetic = self.results.get("magnetic") or self.characterize_inductance(allow_use_cache)
+        L0, Lsc, eta = magnetic["L0"], magnetic["Lsc"], magnetic["eta"]
+
+        # C33 measured directly: [BLA94] II-D, "matches the capacitance measured
+        # between the two windings when they are short-circuited".
+        C33_data = self.measure(7, "Cs", allow_use_cache, band=self.RESONANCE_BAND)
+        _, C33 = self.value_at(C33_data, 100_000.0, "capacitance")
+        print(f"  C33  = {C33*1e12:.2f} pF   (direct, both windings shorted)")
+
+        measured_sums = {}
+        for link, numbers in rbc.LINK_CONFIGS.items():
+            resonances = {}
+            for state, number in numbers.items():
+                data = self.measure(number, "Z", allow_use_cache, band=self.RESONANCE_BAND)
+                resonances[state] = tm.detect_resonances(data)
+            sums = tm.capacitance_sums_from_resonances(resonances, L0, Lsc)
+            found = sum(1 for v in sums.values() if v is not None)
+            measured_sums[link] = sums
+            print(f"  link {link:9s}: {found}/3 resonance equations")
+            if found == 0:
+                self.warn(f"link {link}: no resonances detected -- widen the sweep.")
+
+        solution = tm.solve_six_capacitances(measured_sums, C33, eta)
+        coefficients = solution["coefficients"]
+        if not solution["converged"]:
+            self.warn("The capacitance solver did not converge.")
+        if solution["residual_relative"] > 0.1:
+            self.warn(f"Capacitance fit residual {solution['residual_relative']*100:.1f}% -- "
+                      "the model is not describing the data; check resonance identification.")
+
+        print(f"  solved from {solution['equations_used']} equations, "
+              f"residual {solution['residual_relative']*100:.2f}%")
+        for name in ("C11", "C12", "C13", "C22", "C23", "C33"):
+            print(f"    {name} = {coefficients[name]*1e12:9.3f} pF")
+
+        self.results["capacitance"] = {
+            "coefficients": coefficients,
+            "practical": tm.practical_capacitances(coefficients, eta),
+            "gamma_partial": tm.gamma_capacitances(coefficients, eta),
+            "equations_used": solution["equations_used"],
+            "residual_relative": solution["residual_relative"],
+        }
+        return self.results["capacitance"]
+
+    # ------------------------------------------------- AC winding resistance
+
+    def characterize_ac_resistance(self, gap_labels=None, allow_use_cache=False,
+                                   reference_frequency=10_000.0):
+        """Separate winding from core loss using two or more gaps.
+
+        R_measured = Rw + K*L^2, with K gap-independent -- see
+        TransformerModel.separate_winding_resistance for the derivation.
+
+        This is the ONE recipe that cannot run unattended: the core has to be
+        physically re-gapped between measurements. Never schedule it inside an
+        overnight sweep.
+
+        Use three or more gaps. Two give the exact closed form but no way to
+        tell whether Rw really is gap-independent -- fringing flux near the gap
+        drives proximity loss that changes with the gap. With three or more the
+        fit residual reports that directly.
+        """
+        print("\n-- AC winding resistance (multi-gap, MANUAL re-gapping) --")
+        gap_labels = gap_labels or ["gap1", "gap2", "gap3"]
+        if len(gap_labels) < 2:
+            raise ValueError("Need at least two gaps.")
+        if len(gap_labels) == 2:
+            self.warn("Only two gaps: the fit cannot test whether Rw is gap-independent. "
+                      "Three or more is strongly preferred.")
+
+        sweeps = []
+        for label in gap_labels:
+            path = self.output_path / f"{self.reference}_acr_{label}_RL.csv"
+            if allow_use_cache and path.exists():
+                sweeps.append(pandas.read_csv(path))
+                continue
+            if self.offline:
+                raise RuntimeError(f"Offline and no cached sweep for gap {label!r}.")
+            input(f"  Fit the core with gap '{label}', keep the winding in place, press Enter...")
+            self._set_config(1)
+            data = self.bode_100.take_Rs_Ls_measurement(
+                start_frequency=1000.0, stop_frequency=200_000.0,
+                number_of_measurement_cycles=2, source_power_dbm=self.DRIVE_HIGH_BAND_DBM)
+            data.to_csv(path, index=False)
+            sweeps.append(data)
+
+        # Row-wise: solve Rw at EVERY frequency, not from one scalar inductance.
+        # Rev A extracted a single L per gap and applied it across the whole
+        # sweep, which defeats the point of a frequency-resolved Rw(f).
+        averaged = [tm.average_cycles(s) for s in sweeps]
+        merged = averaged[0][["frequency"]].copy()
+        for index, frame in enumerate(averaged):
+            merged = merged.merge(
+                frame[["frequency", "inductance", "resistance"]].rename(
+                    columns={"inductance": f"L{index}", "resistance": f"R{index}"}),
+                on="frequency", how="inner")
+        if merged.empty:
+            raise ValueError("The gap sweeps share no common frequency points.")
+
+        rows = []
+        for _, row in merged.iterrows():
+            inductances = [row[f"L{i}"] for i in range(len(sweeps))]
+            resistances = [row[f"R{i}"] for i in range(len(sweeps))]
+            try:
+                fit = tm.separate_winding_resistance(inductances, resistances)
+            except Exception:
+                continue
+            rows.append({"frequency": row["frequency"], "Rw": fit["Rw"], "K": fit["K"],
+                         "residual_max": fit["residual_max"], "Rc": resistances[0] - fit["Rw"]})
+        result = pandas.DataFrame(rows)
+        if result.empty:
+            raise RuntimeError("Could not fit Rw at any frequency.")
+
+        _, Rw_ref = self.value_at(
+            result.assign(measurement_index=0), reference_frequency, "Rw")
+        worst_residual = float(result["residual_max"].max())
+        ratio = float(min(merged[f"L{i}"].iloc[0] for i in range(len(sweeps)))
+                      / max(merged[f"L{i}"].iloc[0] for i in range(len(sweeps))))
+
+        print(f"  gaps: {len(gap_labels)}   inductance ratio {ratio:.2f}")
+        print(f"  Rw({reference_frequency/1e3:.0f} kHz) = {Rw_ref*1e3:.2f} mohm")
+        print(f"  worst fit residual: {worst_residual*100:.2f}%")
+        if ratio > 0.5:
+            self.warn(f"Gap inductance ratio {ratio:.2f} is too close to 1. Noise gain "
+                      "grows as 1/(1-ratio^2); aim for 0.5 or lower.")
+        if len(gap_labels) > 2 and worst_residual > 0.03:
+            self.warn(f"Residual {worst_residual*100:.1f}% suggests Rw is NOT gap-independent "
+                      "-- most likely fringing-flux proximity loss. Move the winding away "
+                      "from the gap.")
+
+        self.results["ac_resistance"] = {
+            "Rw_at_reference": Rw_ref, "reference_frequency": reference_frequency,
+            "n_gaps": len(gap_labels), "inductance_ratio": ratio,
+            "worst_residual": worst_residual,
+        }
+        result.to_csv(self.output_path / f"{self.reference}_ac_resistance.csv", index=False)
+        return result
+
+    # ------------------------------------------------------------ top level
+
+    def characterize_all(self, allow_use_cache=False, skip_ac_resistance=True):
+        """Everything that can run unattended."""
+        print("=" * 70)
+        print(f"Characterizing {self.reference}")
+        print("=" * 70)
+        self.verify_switching(allow_use_cache)
+        self.verify_linearity(allow_use_cache=allow_use_cache)
+        self.characterize_inductance(allow_use_cache)
+        self.characterize_resistances(allow_use_cache)
+        self.characterize_capacitance(allow_use_cache)
+        if not skip_ac_resistance:
+            self.characterize_ac_resistance(allow_use_cache=allow_use_cache)
+        self.report()
+        return self.results
+
+    def report(self):
+        print("\n" + "=" * 70)
+        print(f"RESULTS -- {self.reference}")
+        print("=" * 70)
+        magnetic = self.results.get("magnetic", {})
+        losses = self.results.get("losses", {})
+        capacitance = self.results.get("capacitance", {}).get("coefficients", {})
+
+        if magnetic:
+            print(f"  Coupling k               {magnetic['k']:.5f}")
+            print(f"  Turns ratio N2/N1        {magnetic['turns_ratio_N2_N1']:.4f}")
+            print(f"  Magnetizing Lp           {magnetic['Lp_magnetizing']*1e6:.3f} uH")
+            print(f"  Leakage ls               {magnetic['ls_leakage']*1e6:.3f} uH")
+        if losses:
+            print(f"  Primary resistance r1    {losses['r1']*1e3:.2f} mohm")
+            print(f"  Secondary resistance r2  {losses['r2_secondary']*1e3:.2f} mohm "
+                  f"({losses['r2_primary_referred']*1e3:.2f} referred to primary)")
+            if losses.get("Rp"):
+                print(f"  Core loss Rp             {losses['Rp']:.1f} ohm")
+        if capacitance:
+            print(f"  Interwinding C33         {capacitance['C33']*1e12:.2f} pF")
+            print(f"  Primary self C11         {capacitance['C11']*1e12:.2f} pF")
+            print(f"  Secondary self C22       {capacitance['C22']*1e12:.2f} pF")
+
+        print(f"\n  Small-signal measurement at {self.DRIVE_LOW_BAND_DBM}"
+              f"/{self.DRIVE_HIGH_BAND_DBM} dBm -- these are small-signal "
+              "permeability values, not values at operating flux.")
+
+        if self.warnings:
+            print(f"\n  {len(self.warnings)} warning(s):")
+            for message in self.warnings:
+                print(f"    - {message}")
         else:
-            input("Place primary in open circuit, setup secondary up for measurement and press Enter to continue...")
-            data_Ls_OP = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=1000000,
-                number_of_measurement_cycles=2
-            )
-            measured_frequency, data_Ls_OP_at_10kHz = self.extract_value_at_frequency(data_Ls_OP, 10000)
-            print(data_Ls_OP_at_10kHz)
-            data_Ls_OP.to_csv(data_Ls_OP_filepath, index=False)
-
-
-        if allow_use_cache and os.path.exists(data_Lcum_filepath):
-            data_Lcum = pandas.read_csv(data_Lcum_filepath)
-        else:
-            input("Place circuit in cummulative flux mode and press Enter to continue...")
-            data_Lcum = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=1000000,
-                number_of_measurement_cycles=2
-            )
-            measured_frequency, data_Lcum_at_10kHz = self.extract_value_at_frequency(data_Lcum, 10000)
-            print(data_Lcum_at_10kHz)
-            data_Lcum.to_csv(data_Lcum_filepath, index=False)
-
-
-        if allow_use_cache and os.path.exists(data_Ldif_filepath):
-            data_Ldif = pandas.read_csv(data_Ldif_filepath)
-        else:
-            input("Place circuit in differential flux mode and press Enter to continue...")
-            data_Ldif = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=1000000,
-                number_of_measurement_cycles=2
-            )
-            measured_frequency, data_Ldif_at_10kHz = self.extract_value_at_frequency(data_Ldif, 10000)
-            print(data_Ldif_at_10kHz)
-            data_Ldif.to_csv(data_Ldif_filepath, index=False)
-
-
-        temp_data = data_Lp_OS[["frequency"]].copy()
-        temp_data["Lp_OS"] = data_Lp_OS["inductance"]
-        temp_data["Lp_SS"] = data_Lp_SS["inductance"]
-        temp_data["Ls_OP"] = data_Ls_OP["inductance"]
-        temp_data["Lcum"] = data_Lcum["inductance"]
-        temp_data["Ldif"] = data_Ldif["inductance"]
-        print(temp_data[["Lp_SS", "Lp_OS"]])
-        temp_data["coupling_coefficient"] = temp_data.apply(lambda row: math.sqrt(1 - row["Lp_SS"] / row["Lp_OS"]), axis=1)
-        temp_data["n"] = temp_data.apply(lambda row: math.sqrt(row["Lp_OS"] / row["Ls_OP"]), axis=1)
-
-        temp_data["Lmp"] = temp_data.apply(lambda row: (row["Lcum"] - row["Ldif"]) / (4 * row["n"]), axis=1)
-        temp_data["Lwp"] = temp_data.apply(lambda row: row["Lp_OS"] - row["Lmp"], axis=1)
-        temp_data["Lws"] = temp_data.apply(lambda row: row["Ls_OP"] - row["n"] * row["Lmp"], axis=1)
-
-
-    def characterize_capacitance_medium(self, allow_use_cache=False):
-        #  According to Section III of https://sci-hub.st/https://ieeexplore.ieee.org/abstract/document/746603
-
-        data_Lsc_filepath  = self.output_path / f"{self.reference}_medium_capacitance_characterization_data_Lsc.csv"
-        data_L01_filepath  = self.output_path / f"{self.reference}_medium_capacitance_characterization_data_L01.csv"
-        data_L02_filepath  = self.output_path / f"{self.reference}_medium_capacitance_characterization_data_L02.csv"
-        data_cm1_filepath  = self.output_path / f"{self.reference}_medium_capacitance_characterization_data_cm1.csv"
-        data_cm2_filepath  = self.output_path / f"{self.reference}_medium_capacitance_characterization_data_cm2.csv"
-        data_cm3_filepath  = self.output_path / f"{self.reference}_medium_capacitance_characterization_data_cm3.csv"
-        data_cm4_filepath  = self.output_path / f"{self.reference}_medium_capacitance_characterization_data_cm4.csv"
-        data_cm5_filepath  = self.output_path / f"{self.reference}_medium_capacitance_characterization_data_cm5.csv"
-        data_cm6_filepath  = self.output_path / f"{self.reference}_medium_capacitance_characterization_data_cm6.csv"
-
-
-        if allow_use_cache and os.path.exists(data_Lsc_filepath):
-            data_Lsc = pandas.read_csv(data_Lsc_filepath)
-        else:
-            input("Place secondary in short circuit, setup primary up for measurement and press Enter to continue...")
-            data_Lsc = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=40000000,
-                number_of_measurement_cycles=2
-            )
-            data_Lsc.to_csv(data_Lsc_filepath, index=False)
-        # self.bode_100.plot(data_Lsc, "inductance", "Parallel capacitance")
-
-        if allow_use_cache and os.path.exists(data_L01_filepath):
-            data_L01 = pandas.read_csv(data_L01_filepath)
-        else:
-            input("Place secondary in open circuit, setup primary up for measurement and press Enter to continue...")
-            data_L01 = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=40000000,
-                number_of_measurement_cycles=2
-            )
-            data_L01.to_csv(data_L01_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_L02_filepath):
-            data_L02 = pandas.read_csv(data_L02_filepath)
-        else:
-            input("Place primary in open circuit, setup secondary up for measurement and press Enter to continue...")
-            data_L02 = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=40000000,
-                number_of_measurement_cycles=2
-            )
-            data_L02.to_csv(data_L02_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_cm1_filepath):
-            data_cm1 = pandas.read_csv(data_cm1_filepath)
-        else:
-            input("Place secondary and primary in short circuit, connect each to one port and press Enter to continue...")
-            data_cm1 = self.bode_100.take_Cp_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_cm1.to_csv(data_cm1_filepath, index=False)
-        # self.bode_100.plot(data_cm1, "capacitance", "Parallel capacitance")
-
-        if allow_use_cache and os.path.exists(data_cm2_filepath):
-            data_cm2 = pandas.read_csv(data_cm2_filepath)
-        else:
-            input("Connect output of primary with output of secondary, setup primary up for measurement and press Enter to continue...")
-            data_cm2 = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_cm2.to_csv(data_cm2_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_cm3_filepath):
-            data_cm3 = pandas.read_csv(data_cm3_filepath)
-        else:
-            input("Connect output of primary with input of secondary, setup primary up for measurement and press Enter to continue...")
-            data_cm3 = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_cm3.to_csv(data_cm3_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_cm4_filepath):
-            data_cm4 = pandas.read_csv(data_cm4_filepath)
-        else:
-            input("Connect input of primary with input of secondary, short circuit secondary, setup primary up for measurement and press Enter to continue...")
-            data_cm4 = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_cm4.to_csv(data_cm4_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_cm5_filepath):
-            data_cm5 = pandas.read_csv(data_cm5_filepath)
-        else:
-            input("Connect output of secondary with output of primary, short circuit primary, setup secondary up for measurement and press Enter to continue...")
-            data_cm5 = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_cm5.to_csv(data_cm5_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_cm6_filepath):
-            data_cm6 = pandas.read_csv(data_cm6_filepath)
-        else:
-            input("Connect input of secondary with input of primary, short circuit primary, setup secondary up for measurement and press Enter to continue...")
-            data_cm6 = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_cm6.to_csv(data_cm6_filepath, index=False)
-
-        _, Lsc_at_10kHz = self.extract_value_at_frequency(data_Lsc, 10000)
-        _, L01_at_10kHz = self.extract_value_at_frequency(data_L01, 10000)
-        _, L02_at_10kHz = self.extract_value_at_frequency(data_L02, 10000)
-        _, cm1_at_10kHz = self.extract_value_at_frequency(data_cm1, 10000, parameter="capacitance")
-        # self.bode_100.plot_Z(data=data_cm3)
-        cm2_resonances = self.detect_zero_crossing(data=data_cm2)
-        assert len(cm2_resonances) >= 1
-        cm3_resonances = self.detect_zero_crossing(data=data_cm3)
-        assert len(cm3_resonances) >= 1
-        cm4_resonances = self.detect_zero_crossing(data=data_cm4)
-        assert len(cm4_resonances) >= 1
-        cm5_resonances = self.detect_zero_crossing(data=data_cm5)
-        print(cm5_resonances)
-        assert len(cm5_resonances) >= 1
-        cm6_resonances = self.detect_zero_crossing(data=data_cm6)
-        print(cm6_resonances)
-        assert len(cm6_resonances) >= 1
-
-
-
-        turns_ratio = math.sqrt(L02_at_10kHz / L01_at_10kHz)
-        k = math.sqrt(1 - Lsc_at_10kHz / L01_at_10kHz)
-        Lp = L01_at_10kHz * (1 + k) / 2
-        print(f"turns_ratio: {turns_ratio}")
-        print(f"k: {k}")
-        print(f"Lp: {Lp}")
-        print(f"cm1_at_10kHz: {cm1_at_10kHz}")
-        print(f"cm2_resonances[0]['frequency']: {cm2_resonances[0]['frequency']}")
-        print(f"cm3_resonances[0]['frequency']: {cm3_resonances[0]['frequency']}")
-        print(f"cm4_resonances[0]['frequency']: {cm4_resonances[0]['frequency']}")
-        print(f"cm5_resonances[0]['frequency']: {cm5_resonances[0]['frequency']}")
-        print(f"cm6_resonances[0]['frequency']: {cm6_resonances[0]['frequency']}")
-
-        def func(x):
-            return [x[1] + x[2] - cm1_at_10kHz,
-                    x[0] + math.pow(turns_ratio, 2) * x[1] - 1.0 / (Lp * pow(2 * math.pi * cm2_resonances[0]['frequency'], 2)),
-                    x[0] + math.pow(turns_ratio, 2) * x[2] - 1.0 / (Lp * pow(2 * math.pi * cm3_resonances[0]['frequency'], 2))]
-        [C1, C2, C3] = fsolve(func, [1, 1, 1])
-        print(f"C1: {C1}")
-        print(f"C2: {C2}")
-        print(f"C3: {C3}")
-        def func(x):
-            return [x[0] + math.pow(turns_ratio, 2) * x[1] - C1,
-                    x[4] + x[5] - C2,
-                    x[2] - C3,
-                    x[0] + x[2] + x[5] + math.pow(turns_ratio, 2) * x[3] + math.pow(1 + turns_ratio, 2) * x[4] - 1.0 / (Lsc * pow(2 * math.pi * cm4_resonances[0]['frequency'], 2)),
-                    x[1] + x[3] + x[5] + - 1.0 / (Lsc * pow(2 * math.pi * cm5_resonances[0]['frequency'], 2)),
-                    x[1] + x[2] + x[3] + x[4] + - 1.0 / (Lsc * pow(2 * math.pi * cm6_resonances[0]['frequency'], 2)),
-                    ]
-        [gamma1, gamma2, gamma3, gamma4, gamma5, gamma6] = fsolve(func, [1, 1, 1, 1, 1, 1])
-        print(f"gamma1: {gamma1}")
-        print(f"gamma2: {gamma2}")
-        print(f"gamma3: {gamma3}")
-        print(f"gamma4: {gamma4}")
-        print(f"gamma5: {gamma5}")
-        print(f"gamma6: {gamma6}")
-
-
-    def characterize_capacitance_advanced(self, allow_use_cache=False):
-        #  According to https://sci-hub.st/https://ieeexplore.ieee.org/document/293449 and https://sci-hub.st/https://ieeexplore.ieee.org/document/382580
-
-        data_Lsc_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_Lsc.csv"
-        data_L01_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_L01.csv"
-        data_L02_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_L02.csv"
-
-        data_group_1_B_with_D_open_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_1_B_with_D_open.csv"
-        data_group_1_B_with_D_short_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_1_B_with_D_short.csv"
-        data_group_2_A_with_C_open_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_2_A_with_C_open.csv"
-        data_group_2_A_with_C_short_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_2_A_with_C_short.csv"
-        data_group_3_B_with_C_open_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_3_B_with_C_open.csv"
-        data_group_3_B_with_C_short_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_3_B_with_C_short.csv"
-        data_group_4_A_with_D_open_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_4_A_with_D_open.csv"
-        data_group_4_A_with_D_short_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_4_A_with_D_short.csv"
-        data_group_5_all_floating_open_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_5_all_floating_open.csv"
-        data_group_5_all_floating_short_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_5_all_floating_short.csv"
-        data_group_6_A_with_B_and_C_with_D_filepath  = self.output_path / f"{self.reference}_advanced_capacitance_characterization_data_group_6_A_with_B_and_C_with_D.csv"
-
-        if allow_use_cache and os.path.exists(data_Lsc_filepath):
-            data_Lsc = pandas.read_csv(data_Lsc_filepath)
-        else:
-            input("Place secondary in short circuit, setup primary up for measurement and press Enter to continue...")
-            data_Lsc = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=40000000,
-                number_of_measurement_cycles=2
-            )
-            data_Lsc.to_csv(data_Lsc_filepath, index=False)
-            self.bode_100.plot(data_Lsc, "inductance", "Parallel capacitance")
-
-        if allow_use_cache and os.path.exists(data_L01_filepath):
-            data_L01 = pandas.read_csv(data_L01_filepath)
-        else:
-            input("Place secondary in open circuit, setup primary up for measurement and press Enter to continue...")
-            data_L01 = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=40000000,
-                number_of_measurement_cycles=2
-            )
-            data_L01.to_csv(data_L01_filepath, index=False)
-            self.bode_100.plot(data_L01, "inductance", "Parallel capacitance")
-
-        if allow_use_cache and os.path.exists(data_L02_filepath):
-            data_L02 = pandas.read_csv(data_L02_filepath)
-        else:
-            input("Place primary in open circuit, setup secondary up for measurement and press Enter to continue...")
-            data_L02 = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=40000000,
-                number_of_measurement_cycles=2
-            )
-            data_L02.to_csv(data_L02_filepath, index=False)
-            self.bode_100.plot(data_L02, "inductance", "Parallel capacitance")
-
-
-        if allow_use_cache and os.path.exists(data_group_1_B_with_D_open_filepath):
-            data_group_1_B_with_D_open = pandas.read_csv(data_group_1_B_with_D_open_filepath)
-        else:
-            input("Connect output of primary with output of secondary, leave secondary open, setup primary up for measurement and press Enter to continue...")
-            data_group_1_B_with_D_open = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_1_B_with_D_open.to_csv(data_group_1_B_with_D_open_filepath, index=False)
-            self.bode_100.plot_Z(data=data_group_1_B_with_D_open)
-
-        if allow_use_cache and os.path.exists(data_group_1_B_with_D_short_filepath):
-            data_group_1_B_with_D_short = pandas.read_csv(data_group_1_B_with_D_short_filepath)
-        else:
-            input("Connect output of primary with output of secondary, leave secondary short-circuited, setup primary up for measurement and press Enter to continue...")
-            data_group_1_B_with_D_short = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_1_B_with_D_short.to_csv(data_group_1_B_with_D_short_filepath, index=False)
-            self.bode_100.plot_Z(data=data_group_1_B_with_D_short)
-
-        if allow_use_cache and os.path.exists(data_group_2_A_with_C_open_filepath):
-            data_group_2_A_with_C_open = pandas.read_csv(data_group_2_A_with_C_open_filepath)
-        else:
-            input("Connect input of primary with input of secondary, leave secondary open, setup primary up for measurement and press Enter to continue...")
-            data_group_2_A_with_C_open = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_2_A_with_C_open.to_csv(data_group_2_A_with_C_open_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_group_2_A_with_C_short_filepath):
-            data_group_2_A_with_C_short = pandas.read_csv(data_group_2_A_with_C_short_filepath)
-        else:
-            input("Connect input of primary with input of secondary, leave secondary short-circuited, setup primary up for measurement and press Enter to continue...")
-            data_group_2_A_with_C_short = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_2_A_with_C_short.to_csv(data_group_2_A_with_C_short_filepath, index=False)
-
-
-        if allow_use_cache and os.path.exists(data_group_3_B_with_C_open_filepath):
-            data_group_3_B_with_C_open = pandas.read_csv(data_group_3_B_with_C_open_filepath)
-        else:
-            input("Connect ouput of primary with input of secondary, leave secondary open, setup primary up for measurement and press Enter to continue...")
-            data_group_3_B_with_C_open = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_3_B_with_C_open.to_csv(data_group_3_B_with_C_open_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_group_3_B_with_C_short_filepath):
-            data_group_3_B_with_C_short = pandas.read_csv(data_group_3_B_with_C_short_filepath)
-        else:
-            input("Connect ouput of primary with input of secondary, leave secondary short-circuited, setup primary up for measurement and press Enter to continue...")
-            data_group_3_B_with_C_short = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_3_B_with_C_short.to_csv(data_group_3_B_with_C_short_filepath, index=False)
-
-
-        if allow_use_cache and os.path.exists(data_group_4_A_with_D_open_filepath):
-            data_group_4_A_with_D_open = pandas.read_csv(data_group_4_A_with_D_open_filepath)
-        else:
-            input("Connect input of primary with output of secondary, leave secondary open, setup primary up for measurement and press Enter to continue...")
-            data_group_4_A_with_D_open = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_4_A_with_D_open.to_csv(data_group_4_A_with_D_open_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_group_4_A_with_D_short_filepath):
-            data_group_4_A_with_D_short = pandas.read_csv(data_group_4_A_with_D_short_filepath)
-        else:
-            input("Connect input of primary with output of secondary, leave secondary short-circuited, setup primary up for measurement and press Enter to continue...")
-            data_group_4_A_with_D_short = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_4_A_with_D_short.to_csv(data_group_4_A_with_D_short_filepath, index=False)
-
-
-        if allow_use_cache and os.path.exists(data_group_5_all_floating_open_filepath):
-            data_group_5_all_floating_open = pandas.read_csv(data_group_5_all_floating_open_filepath)
-        else:
-            input("Leave secondary open, setup primary up for measurement and press Enter to continue...")
-            data_group_5_all_floating_open = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_5_all_floating_open.to_csv(data_group_5_all_floating_open_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_group_5_all_floating_short_filepath):
-            data_group_5_all_floating_short = pandas.read_csv(data_group_5_all_floating_short_filepath)
-        else:
-            input("Leave secondary short-circuited, setup primary up for measurement and press Enter to continue...")
-            data_group_5_all_floating_short = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_5_all_floating_short.to_csv(data_group_5_all_floating_short_filepath, index=False)
-
-
-        if allow_use_cache and os.path.exists(data_group_6_A_with_B_and_C_with_D_filepath):
-            data_group_6_A_with_B_and_C_with_D = pandas.read_csv(data_group_6_A_with_B_and_C_with_D_filepath)
-        else:
-            input("Place secondary and primary in short circuit, connect each to one port and press Enter to continue...")
-            data_group_6_A_with_B_and_C_with_D = self.bode_100.take_Cp_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            data_group_6_A_with_B_and_C_with_D.to_csv(data_group_6_A_with_B_and_C_with_D_filepath, index=False)
-
-
-        _, lsc = self.extract_value_at_frequency(data_Lsc, 10000)
-        _, L0 = self.extract_value_at_frequency(data_L01, 10000)
-        _, L0prima = self.extract_value_at_frequency(data_L02, 10000)
-        turns_ratio = math.sqrt(L0prima / L0)
-        
-        equations = []
-
-        _, C33_at_10kHz = self.extract_value_at_frequency(data_group_6_A_with_B_and_C_with_D, 10000, parameter="capacitance")
-        C33 = C33_at_10kHz
-
-        data_group_1_B_with_D_open_resonances = self.detect_zero_crossing(data=data_group_1_B_with_D_open)
-        data_group_1_B_with_D_short_resonances = self.detect_zero_crossing(data=data_group_1_B_with_D_short)
-        assert len(data_group_1_B_with_D_open_resonances) >= 1
-        # self.bode_100.plot_Z(data=data_group_1_B_with_D_short)
-        # assert len(data_group_1_B_with_D_short_resonances) >= 1
-
-        if len(data_group_1_B_with_D_open_resonances) > 0:
-            assert data_group_1_B_with_D_open_resonances[0]['type'] == "local maximum"
-            f2 = data_group_1_B_with_D_open_resonances[0]['frequency']
-            C1_plus_C2 = 1.0 / (L0 * pow(2 * math.pi * f2, 2))
-            equations.append(f"C11 + math.pow({turns_ratio}, 2) * C22 + 2 * {turns_ratio} * C12 - {C1_plus_C2}")
-
-        if len(data_group_1_B_with_D_short_resonances) > 0:
-            assert data_group_1_B_with_D_short_resonances[0]['type'] == "local maximum"
-            f3 = data_group_1_B_with_D_short_resonances[0]['frequency']
-            C1_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f3, 2))
-            equations.append(f"C11 - {C1_plus_C3}")
-
-
-        if len(data_group_1_B_with_D_open_resonances) > 1:
-            assert data_group_1_B_with_D_open_resonances[1]['type'] == "local minimum"
-            f4 = data_group_1_B_with_D_open_resonances[1]['frequency']
-            C2_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f4, 2))
-            equations.append(f"math.pow({turns_ratio}, 2) * C22 - {C2_plus_C3}")
-
-
-        data_group_2_A_with_C_open_resonances = self.detect_zero_crossing(data=data_group_2_A_with_C_open)
-        data_group_2_A_with_C_short_resonances = self.detect_zero_crossing(data=data_group_2_A_with_C_short)
-
-
-        if len(data_group_2_A_with_C_open_resonances) > 0:
-            assert data_group_2_A_with_C_open_resonances[0]['type'] == "local maximum"
-            f2 = data_group_2_A_with_C_open_resonances[0]['frequency']
-            C1_plus_C2 = 1.0 / (L0 * pow(2 * math.pi * f2, 2))
-            equations.append(f"C11 + {C33} + 2 * C13 + math.pow({turns_ratio}, 2) * (C22 + {C33} - 2 * C23) + 2 * {turns_ratio} * (C12 - {C33} - C13 + C23) - {C1_plus_C2}")
-
-
-        if len(data_group_2_A_with_C_short_resonances) > 0:
-            assert data_group_2_A_with_C_short_resonances[0]['type'] == "local maximum"
-            f3 = data_group_2_A_with_C_short_resonances[0]['frequency']
-            C1_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f3, 2))
-            equations.append(f"C11 + {C33} + 2 * C13 - {C1_plus_C3}")
-
-        if len(data_group_2_A_with_C_open_resonances) > 1:
-            assert data_group_2_A_with_C_open_resonances[1]['type'] == "local minimum"
-            f4 = data_group_2_A_with_C_open_resonances[1]['frequency']
-            C2_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f4, 2))
-            equations.append(f"math.pow({turns_ratio}, 2) * (C22 + {C33} - 2 * C23) - {C2_plus_C3}")
-
-        data_group_3_B_with_C_open_resonances = self.detect_zero_crossing(data=data_group_3_B_with_C_open)
-        data_group_3_B_with_C_short_resonances = self.detect_zero_crossing(data=data_group_3_B_with_C_short)
-        if len(data_group_3_B_with_C_open_resonances) > 0:
-            assert data_group_3_B_with_C_open_resonances[0]['type'] == "local maximum"
-            f2 = data_group_3_B_with_C_open_resonances[0]['frequency']
-            C1_plus_C2 = 1.0 / (L0 * pow(2 * math.pi * f2, 2))
-            equations.append(f"C11 + math.pow({turns_ratio}, 2) * (C22 + {C33} - 2 * C23) + 2 * {turns_ratio} * (C12 - C13) - {C1_plus_C2}")
-
-        if len(data_group_3_B_with_C_short_resonances) > 0:
-            assert data_group_3_B_with_C_short_resonances[0]['type'] == "local maximum"
-            f3 = data_group_3_B_with_C_short_resonances[0]['frequency']
-            C1_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f3, 2))
-            equations.append(f"C11 - {C1_plus_C3}")
-
-        if len(data_group_3_B_with_C_short_resonances) > 1:
-            assert data_group_3_B_with_C_open_resonances[1]['type'] == "local minimum"
-            f4 = data_group_3_B_with_C_open_resonances[1]['frequency']
-            C2_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f4, 2))
-            equations.append(f"math.pow({turns_ratio}, 2) * (C22 + {C33} - 2 * C23) - {C2_plus_C3}")
-
-        data_group_4_A_with_D_open_resonances = self.detect_zero_crossing(data=data_group_4_A_with_D_open)
-        data_group_4_A_with_D_short_resonances = self.detect_zero_crossing(data=data_group_4_A_with_D_short)
-
-        if len(data_group_4_A_with_D_open_resonances) > 0:
-            assert data_group_4_A_with_D_open_resonances[0]['type'] == "local maximum"
-            f2 = data_group_4_A_with_D_open_resonances[0]['frequency']
-            C1_plus_C2 = 1.0 / (L0 * pow(2 * math.pi * f2, 2))
-            equations.append(f"C11 + {C33} + 2 * C13 + math.pow({turns_ratio}, 2) * C22 + 2 * {turns_ratio} * (C12 + C23) - {C1_plus_C2}")
-
-        if len(data_group_4_A_with_D_short_resonances) > 0:
-            assert data_group_4_A_with_D_short_resonances[0]['type'] == "local maximum"
-            f3 = data_group_4_A_with_D_short_resonances[0]['frequency']
-            C1_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f3, 2))
-            equations.append(f"C11 + {C33} + 2 * C13 - {C1_plus_C3}")
-
-        if len(data_group_4_A_with_D_open_resonances) > 1:
-            assert data_group_4_A_with_D_open_resonances[1]['type'] == "local minimum"
-            f4 = data_group_4_A_with_D_open_resonances[1]['frequency']
-            C2_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f4, 2))
-            equations.append(f"math.pow({turns_ratio}, 2) * C22 - {C2_plus_C3}")
-
-        data_group_5_all_floating_open_resonances = self.detect_zero_crossing(data=data_group_5_all_floating_open)
-        data_group_5_all_floating_short_resonances = self.detect_zero_crossing(data=data_group_5_all_floating_short)
-
-        if len(data_group_5_all_floating_open_resonances) > 0:
-            assert data_group_5_all_floating_open_resonances[0]['type'] == "local maximum"
-            f2 = data_group_5_all_floating_open_resonances[0]['frequency']
-            C1_plus_C2 = 1.0 / (L0 * pow(2 * math.pi * f2, 2))
-            equations.append(f"C11 - math.pow(C13, 2) / {C33} + math.pow({turns_ratio}, 2) * (C22 - math.pow(C23, 2) / {C33}) + 2 * {turns_ratio} * (C12 - C13 * C23 / {C33}) - {C1_plus_C2}")
-
-        if len(data_group_5_all_floating_short_resonances) > 0:
-            assert data_group_5_all_floating_short_resonances[0]['type'] == "local maximum"
-            f3 = data_group_5_all_floating_short_resonances[0]['frequency']
-            C1_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f3, 2))
-            equations.append(f"C11 - math.pow(C13, 2) / {C33} - {C1_plus_C3}")
-
-        if len(data_group_5_all_floating_open_resonances) > 1:
-            assert data_group_5_all_floating_open_resonances[1]['type'] == "local minimum"
-            f4 = data_group_5_all_floating_open_resonances[1]['frequency']
-            C2_plus_C3 = 1.0 / (lsc * pow(2 * math.pi * f4, 2))
-            equations.append(f"math.pow({turns_ratio}, 2) * (C22 - math.pow(C23, 2) / {C33}) - {C2_plus_C3}")
-
-
-        print(equations)
-        def func(variables):
-            (C11, C12, C13, C22, C23) = variables
-            res = []
-            for eq in equations:
-                res.append(eval(eq))
-            return res
-
-        result = least_squares(func, [0.1e-9, 0.1e-9, 0.1e-9, 0.1e-9, 0.1e-9], loss='cauchy', f_scale=0.1, ftol=1e-05, xtol=1e-05)
-        print(result)
-        [C11, C12, C13, C22, C23] = result.x
-
-
-        def func(variables):
-            (C1, C2, C3) = variables
-            return [C1 + C3 - C11,
-                    C2 + C3 - math.pow(turns_ratio, 2) * C22,
-                    C1 + C2 - C11 - math.pow(turns_ratio, 2) * C22 - 2 * turns_ratio * C12]
-        [C1, C2, C3] = fsolve(func, [1, 1, 1])
-        print(f"C1: {C1}")
-        print(f"C2: {C2}")
-        print(f"C3: {C3}")
-
-    def characterize_ac_resistance(self, allow_use_cache=False):
-
-        data_1_filepath  = self.output_path / f"{self.reference}_ac_resistance_characterization_data_1.csv"
-        data_Z1_filepath  = self.output_path / f"{self.reference}_ac_resistance_characterization_data_Z1.csv"
-        data_Z2_filepath  = self.output_path / f"{self.reference}_ac_resistance_characterization_data_Z2.csv"
-        data_2_filepath  = self.output_path / f"{self.reference}_ac_resistance_characterization_data_2.csv"
-
-        if allow_use_cache and os.path.exists(data_1_filepath):
-            data_1 = pandas.read_csv(data_1_filepath)
-        else:
-            input("Place winding with first gap combination...")
-            data_1 = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=100000,
-                number_of_measurement_cycles=2
-            )
-            data_1.to_csv(data_1_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_Z1_filepath):
-            data_Z1 = pandas.read_csv(data_Z1_filepath)
-        else:
-            data_Z1 = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            self.bode_100.plot_Z(data=data_Z1)
-            data_Z1.to_csv(data_Z1_filepath, index=False)
-
-        resonances = self.detect_zero_crossing(data=data_Z1)
-        print(resonances)
-
-        _, Lmag_10k = self.extract_value_at_frequency(data_1, 100)
-        _, R1_100 = self.extract_value_at_frequency(data_1, 100, "resistance")
-        print("R1_100")
-        print(R1_100)
-
-        w_res = 2 * math.pi * resonances[0]["frequency"]
-        Cp = 1. / (w_res**2 * Lmag_10k)
-        print(Cp)
-        print(Lmag_10k)
-        data_1["Rcw"] = [0] * len(data_1.index)
-        for index, row in data_1.iterrows():
-            w = 2 * math.pi * row["frequency"]
-            Rm = row["resistance"]
-            Rcw = 1. / (2 * Cp**2 * w**2 * Rm) * (1 - math.sqrt(2 * Lmag_10k * Rm * Cp**2 * w**3 - 2 * Rm * Cp * w + 1) * math.sqrt(-2 * Lmag_10k * Rm * Cp**2 * w**3 + 2 * Rm * Cp * w + 1))
-            data_1.loc[index, "Rcw"] = Rcw 
-
-        if allow_use_cache and os.path.exists(data_2_filepath):
-            data_2 = pandas.read_csv(data_2_filepath)
-        else:
-            input("Place winding with second gap combination...")
-            data_2 = self.bode_100.take_Rs_Ls_measurement(
-                start_frequency=10000,
-                stop_frequency=100000,
-                number_of_measurement_cycles=2
-            )
-            data_2.to_csv(data_2_filepath, index=False)
-
-        if allow_use_cache and os.path.exists(data_Z2_filepath):
-            data_Z2 = pandas.read_csv(data_Z2_filepath)
-        else:
-            data_Z2 = self.bode_100.take_Z_phase_measurement(
-                number_of_measurement_cycles=2,
-                start_frequency=10000,
-                stop_frequency=40000000
-            )
-            self.bode_100.plot_Z(data=data_Z2)
-            data_Z2.to_csv(data_Z2_filepath, index=False)
-
-        resonances = self.detect_zero_crossing(data=data_Z2)
-        print(resonances)
-
-        _, Lmag_2_10k = self.extract_value_at_frequency(data_2, 100)
-        _, R2_100 = self.extract_value_at_frequency(data_2, 100, "resistance")
-        print("R2_100")
-        print(R2_100)
-
-
-        w_res = 2 * math.pi * resonances[0]["frequency"]
-        Cp = 1. / (w_res**2 * Lmag_2_10k)
-        data_2["Rcw"] = [0] * len(data_2.index)
-        for index, row in data_2.iterrows():
-            w = 2 * math.pi * row["frequency"]
-            Rm = row["resistance"]
-            Rcw = 1. / (2 * Cp**2 * w**2 * Rm) * (1 - math.sqrt(2 * Lmag_10k * Rm * Cp**2 * w**3 - 2 * Rm * Cp * w + 1) * math.sqrt(-2 * Lmag_10k * Rm * Cp**2 * w**3 + 2 * Rm * Cp * w + 1))
-            data_2.loc[index, "Rcw"] = Rcw 
-
-        data_1["Rw"] = data_1["Rcw"] - (2 * math.pi * data_1["frequency"] * Lmag_10k)**2 / (((2 * math.pi * data_1["frequency"] * Lmag_10k)**2 - (2 * math.pi * data_1["frequency"] * Lmag_2_10k)**2) / (data_1["Rcw"] - data_2["Rcw"]))
-        data_1["Rc"] = data_1["Rcw"] - data_1["Rw"]
-        print(data_1)
-        print(data_2)
-        self.bode_100.plot(
-            data=data_1,
-            column="Rw",
-            label="Rw",
-        )
-
-
+            print("\n  No warnings.")
+
+        destination = self.output_path / f"{self.reference}_results.json"
+        with open(destination, "w") as handle:
+            json.dump({"reference": self.reference, "results": self.results,
+                       "warnings": self.warnings}, handle, indent=2, default=float)
+        print(f"\n  Written to {destination}")
+        print("=" * 70)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument("reference", nargs="?", default="temp",
+                        help="DUT reference; names the cache and output files")
+    parser.add_argument("--cache", action="store_true",
+                        help="reuse cached CSVs instead of measuring (works offline)")
+    parser.add_argument("--port", default=None, help="relay board VISA resource, e.g. ASRL5::INSTR")
+    parser.add_argument("--bode-ip", default=None, help="Bode 100 SCPI server address")
+    parser.add_argument("--ac-resistance", action="store_true",
+                        help="also run the multi-gap AC resistance recipe (needs manual re-gapping)")
+    parser.add_argument("--gaps", nargs="*", default=None, help="gap labels for --ac-resistance")
+    parser.add_argument("--no-auto-calibrate", action="store_true")
+    arguments = parser.parse_args()
+
+    characterizer = MagneticCharacterizer(
+        reference=arguments.reference, relay_board_port=arguments.port,
+        bode_ip=arguments.bode_ip, auto_calibrate=not arguments.no_auto_calibrate)
+    characterizer.characterize_all(allow_use_cache=arguments.cache,
+                                   skip_ac_resistance=not arguments.ac_resistance)
+    if arguments.ac_resistance and arguments.gaps:
+        characterizer.characterize_ac_resistance(gap_labels=arguments.gaps,
+                                                 allow_use_cache=arguments.cache)
 
 
 if __name__ == "__main__":
-    # characterizer = MagneticCharacterizer("750315213")  # Small
-    # characterizer = MagneticCharacterizer("750341867")  # Large
-    # characterizer = MagneticCharacterizer("Custom_Two_Layers")  # Large
-    # characterizer = MagneticCharacterizer("Custom_Inductor")  # Large
-    # characterizer = MagneticCharacterizer("Flyback_0")  # Large
-    # characterizer = MagneticCharacterizer("Flyback_1")  # Large
-    characterizer = MagneticCharacterizer("Flyback_2")  # Large
-    # characterizer.characterize_inductance_basic(True)
-    # characterizer.characterize_inductance_medium(True)
-    # characterizer.characterize_inductance_advanced(True)
-    # characterizer.extract_resonances(False)
-    # characterizer.characterize_capacitance_advanced(True)
-    # characterizer.characterize_capacitance_medium(True)
-    # characterizer.characterize_capacitance_medium(False)
-    characterizer.characterize_ac_resistance(True)
+    main()

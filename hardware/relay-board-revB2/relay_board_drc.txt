@@ -1,0 +1,37 @@
+** Drc report for relay_board.kicad_pcb **
+** Created on 2026-08-31T02:41:09+0200 **
+
+** Found 5 DRC violations **
+[track_dangling]: Track has unconnected end
+    Local override; warning
+    @(173.3520 mm, 52.7646 mm): Track [/+3V3] on F.Cu, length 0.2886 mm
+[via_dangling]: Via is not connected or connected on only one layer
+    Local override; warning
+    @(165.8500 mm, 117.9000 mm): Via [/+3V3] on F.Cu - B.Cu
+[track_dangling]: Track has unconnected end
+    Local override; warning
+    @(154.2125 mm, 53.0000 mm): Track [/GND] on F.Cu, length 1.4000 mm
+[via_dangling]: Via is not connected or connected on only one layer
+    Local override; warning
+    @(160.9500 mm, 78.6350 mm): Via [/K12_COIL] on F.Cu - B.Cu
+[track_dangling]: Track has unconnected end
+    Local override; warning
+    @(72.3195 mm, 113.9000 mm): Track [/RAIL_HI] on F.Cu, length 0.4522 mm
+
+** Found 3 unconnected pads **
+[unconnected_items]: Missing connection between items
+    Local override; error
+    @(158.0250 mm, 78.6350 mm): Pad 5 [/GPIO12] of U3 on F.Cu
+    @(163.7500 mm, 116.1625 mm): Pad 21 [/GPIO12] of U1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; error
+    @(158.0250 mm, 65.1750 mm): Pad 7 [/GPIO7] of U2 on F.Cu
+    @(161.2500 mm, 116.1625 mm): Pad 16 [/GPIO7] of U1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; error
+    @(158.0250 mm, 73.5550 mm): Pad 1 [/GPIO8] of U3 on F.Cu
+    @(161.7500 mm, 116.1625 mm): Pad 17 [/GPIO8] of U1 on F.Cu
+
+** Found 0 Footprint errors **
+
+** End of Report **

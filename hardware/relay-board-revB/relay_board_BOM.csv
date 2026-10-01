@@ -1,0 +1,27 @@
+Comment,Designator,Footprint,Quantity,Manufacturer Part,Description
+22uF,"C1,C2",C_0805_2012Metric,2,,C_0805_2012Metric
+1uF,"C3,C4",C_0603_1608Metric,2,,C_0603_1608Metric
+100nF,"C5,C6,C7,C8,C9,C10,C11,C12,C15",C_0402_1005Metric,9,,C_0402_1005Metric
+PWR,D1,LED_0603_1608Metric,1,,LED_0603_1608Metric
+USBLC6-2SC6,D2,SOT-23-6,1,ST USBLC6-2SC6,"USB 2.0 ESD array, IEC 61000-4-2 level 4"
+USB-C,J1,USB_C_Receptacle_HRO_TYPE-C-31-M-12,1,HRO TYPE-C-31-M-12,"USB-C receptacle, USB 2.0, 16 pin"
+DUT A,J2,"TerminalBlock_Phoenix_MPT-0,5-2-2.54_1x02_P2.54mm_Horizontal",1,"Phoenix 1725656 (MPT 0,5/2-2,54)","spring-cage DUT clamp, 2 positions, wire entry from top edge"
+DUT B,J3,"TerminalBlock_Phoenix_MPT-0,5-2-2.54_1x02_P2.54mm_Horizontal",1,"Phoenix 1725656 (MPT 0,5/2-2,54)","spring-cage DUT clamp, 2 positions, wire entry from top edge"
+DUT C,J4,"TerminalBlock_Phoenix_MPT-0,5-2-2.54_1x02_P2.54mm_Horizontal",1,"Phoenix 1725656 (MPT 0,5/2-2,54)","spring-cage DUT clamp, 2 positions, wire entry from top edge"
+DUT D,J5,"TerminalBlock_Phoenix_MPT-0,5-2-2.54_1x02_P2.54mm_Horizontal",1,"Phoenix 1725656 (MPT 0,5/2-2,54)","spring-cage DUT clamp, 2 positions, wire entry from top edge"
+BNC SOURCE,J6,BNC_Amphenol_B6252HB-NPP3G-50_Horizontal,1,Amphenol B6252HB-NPP3G-50,50R right-angle BNC jack
+BNC CH1,J7,BNC_Amphenol_B6252HB-NPP3G-50_Horizontal,1,Amphenol B6252HB-NPP3G-50,50R right-angle BNC jack
+SWD,J8,PinHeader_1x05_P1.27mm_Vertical,1,CNC Tech 3220-05-0100-00,1.27 mm SWD header
+BNC CH2,J9,BNC_Amphenol_B6252HB-NPP3G-50_Horizontal,1,Amphenol B6252HB-NPP3G-50,50R right-angle BNC jack
+G6K-2F-RF-S DC5,"K1,K2,K3,K4,K5,K6,K7,K8,K9,K10,K11,K12,K13,K14,K15,K16,K17,K18",Relay_Omron_G6K-2F-RF-S,18,Omron G6K-2F-RF-S DC5,"high-frequency DPDT relay, 5 V coil"
+5.1k,"R1,R2",R_0402_1005Metric,2,,R_0402_1005Metric
+1k,R10,R_0402_1005Metric,1,,R_0402_1005Metric
+1k 0.1%,R12,R_0805_2012Metric,1,Vishay TNPW08051K00BEEA,bridge RV1: 1k 0.1% 25 ppm thin film
+47R 0.1%,"R13,R16",R_0805_2012Metric,2,Vishay TNPW080547R0BEEA,bridge RV2/RC2: 47R 0.1% 25 ppm thin film
+4R7,"R14,R15",R_0805_2012Metric,2,Vishay TNPW08054R70BEEA,bridge RC1 shunt half: 4R7 0.1% (two in parallel = 2R35)
+10k,"R3,R4",R_0402_1005Metric,2,,R_0402_1005Metric
+100R 0.1%,R5,R_0805_2012Metric,1,Vishay TNPW0805100RBEEA,LOAD standard: 100R 0.1% 25 ppm thin film
+0R,"R9,R11",R_0805_2012Metric,2,,R_0805_2012Metric
+STM32F072CBT6,U1,LQFP-48_7x7mm_P0.5mm,1,ST STM32F072CBT6,"Cortex-M0, 128K flash, crystal-less USB (HSI48 + CRS)"
+TBD62003APG,"U2,U3,U4",SOIC-16_3.9x9.9mm_P1.27mm,3,Toshiba TBD62003AFG,7ch DMOS sink driver (SOIC-16 = AFG suffix)
+AP2112K-3.3,U5,SOT-23-5,1,Diodes AP2112K-3.3TRG1,"3.3 V 600 mA LDO, 250 mV dropout"

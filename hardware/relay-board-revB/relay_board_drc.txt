@@ -1,0 +1,10 @@
+** Drc report for relay_board.kicad_pcb **
+** Created on 2026-08-31T00:35:32+0200 **
+
+** Found 0 DRC violations **
+
+** Found 0 unconnected pads **
+
+** Found 0 Footprint errors **
+
+** End of Report **

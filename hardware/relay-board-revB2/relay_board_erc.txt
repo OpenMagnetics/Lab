@@ -1,0 +1,59 @@
+ERC report (2026-08-31T01:32:37+0200, Encoding UTF8)
+
+***** Sheet /
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(49.53 mm, 44.45 mm): Symbol K1 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(49.53 mm, 91.44 mm): Symbol K2 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(101.60 mm, 44.45 mm): Symbol K4 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(101.60 mm, 91.44 mm): Symbol K5 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(49.53 mm, 137.16 mm): Symbol K3 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(153.67 mm, 44.45 mm): Symbol K7 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(101.60 mm, 137.16 mm): Symbol K6 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(153.67 mm, 91.44 mm): Symbol K8 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(49.53 mm, 199.39 mm): Symbol K15 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(153.67 mm, 137.16 mm): Symbol K9 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(205.74 mm, 44.45 mm): Symbol K10 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(101.60 mm, 199.39 mm): Symbol K16 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(205.74 mm, 91.44 mm): Symbol K11 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(240.03 mm, 44.45 mm): Symbol K13 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(205.74 mm, 137.16 mm): Symbol K12 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(153.67 mm, 199.39 mm): Symbol K17 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(240.03 mm, 91.44 mm): Symbol K14 [G6K-2]
+[footprint_link_issues]: The current configuration does not include the footprint library 'OpenMagnetics'.
+    ; warning
+    @(205.74 mm, 199.39 mm): Symbol K18 [G6K-2]
+
+ ** ERC messages: 18  Errors 0  Warnings 18
