@@ -9,6 +9,8 @@
 #   make                       build/relay_board.elf/.bin
 #   make flash                 via SWD (st-flash from stlink-tools)
 #   make dfu                   via the built-in DFU bootloader (hold BOOT0)
+#   make update                over USB, no BOOT0: SYST:DFU + STM32CubeProgrammer
+#                              (scripts/update_firmware.py; needs fw >= 1.1.0)
 
 OPENCM3_DIR ?= ../libopencm3
 PREFIX      ?= arm-none-eabi
@@ -54,7 +56,10 @@ flash: $(TARGET).bin
 dfu: $(TARGET).bin
 	dfu-util -a 0 -s 0x08000000:leave -D $(TARGET).bin
 
+update: $(TARGET).bin
+	python ../scripts/update_firmware.py $(TARGET).bin
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all flash dfu clean
+.PHONY: all flash dfu update clean

@@ -12,10 +12,13 @@
  * host can trust that a measurement started after OPC sees settled contacts.
  */
 
+#include <libopencm3/cm3/scb.h>
 #include <libopencm3/cm3/systick.h>
 #include <libopencm3/stm32/crs.h>
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/rcc.h>
+#include <libopencm3/stm32/st_usbfs.h>
+#include <libopencm3/stm32/syscfg.h>
 
 #include "relay_map.h"
 #include "scpi.h"
@@ -31,9 +34,33 @@ static uint32_t relay_word;          /* current coil states, bit n = K(n+1) */
 static uint8_t current_config;      /* 1..CONFIG_COUNT, 0 = none           */
 static cal_mode_t cal_mode = CAL_MODE_MEAS;
 
+/* SysTick runs at TICK_HZ; `milliseconds` advances every TICK_HZ/1000 ticks.
+ *
+ * Status LED (PC13 high = lit): steady and dim rather than a full-brightness
+ * blink.  PC13 has no timer channel, so PWM it from the tick: lit for
+ * LED_ON_TICKS out of every LED_PERIOD_TICKS (100 Hz, too fast to flicker;
+ * 2 % duty). */
+#define TICK_HZ          10000u
+#define LED_PERIOD_TICKS 100u
+#define LED_ON_TICKS     2u
+
 void sys_tick_handler(void)
 {
-    milliseconds++;
+    static uint8_t sub_ms;
+    static uint8_t led_phase;
+
+    if (++sub_ms >= TICK_HZ / 1000u) {
+        sub_ms = 0u;
+        milliseconds++;
+    }
+    if (++led_phase >= LED_PERIOD_TICKS) {
+        led_phase = 0u;
+    }
+    if (led_phase < LED_ON_TICKS) {
+        gpio_set(GPIOC, GPIO13);
+    } else {
+        gpio_clear(GPIOC, GPIO13);
+    }
 }
 
 static void delay_ms(uint32_t amount)
@@ -42,6 +69,53 @@ static void delay_ms(uint32_t amount)
     while ((milliseconds - start) < amount) {
         __asm__("wfi");
     }
+}
+
+/* ------------------------------------------------------- DFU bootloader */
+
+/* SYST:DFU re-enters the ROM USB DFU bootloader without the BOOT0 strap, so
+ * a flashed board can be updated over USB alone.  The jump is made right
+ * after a reset, with the core in its reset state (HSI 8 MHz, no peripherals,
+ * no interrupts) -- what the ROM expects.  The request crosses the reset in
+ * .noinit RAM, which the startup code neither loads nor zeroes. */
+#define DFU_MAGIC     0xDF00B007u
+#define SYSTEM_MEMORY 0x1FFFC800u      /* F072 ROM bootloader (AN2606) */
+
+static uint32_t dfu_request __attribute__((section(".noinit")));
+static volatile uint8_t dfu_pending;
+
+static void relay_apply(uint32_t word);
+
+static void enter_bootloader_if_requested(void)
+{
+    if (dfu_request != DFU_MAGIC) {
+        return;
+    }
+    dfu_request = 0u;
+    rcc_periph_clock_enable(RCC_SYSCFG_COMP);
+    SYSCFG_CFGR1 = (SYSCFG_CFGR1 & ~(uint32_t)SYSCFG_CFGR1_MEM_MODE)
+                   | SYSCFG_CFGR1_MEM_MODE_SYSTEM;
+    const volatile uint32_t *vectors = (const volatile uint32_t *)SYSTEM_MEMORY;
+    uint32_t stack = vectors[0];
+    uint32_t entry = vectors[1];
+    __asm__ volatile("msr msp, %0\n\tbx %1" : : "r"(stack), "r"(entry));
+    for (;;) {
+    }
+}
+
+int scpi_action_enter_dfu(void)
+{
+    dfu_pending = 1u;                   /* acted on from the main loop */
+    return SCPI_ERR_NONE;
+}
+
+static void reboot_into_bootloader(void)
+{
+    relay_apply(0u);                    /* leave every relay released */
+    *USB_BCDR_REG &= ~(uint32_t)USB_BCDR_DPPU;   /* drop the D+ pull-up: host sees */
+    delay_ms(100u);                     /* an unplug before DFU appears   */
+    dfu_request = DFU_MAGIC;
+    scb_reset_system();
 }
 
 /* ------------------------------------------------------------------ clock */
@@ -61,7 +135,7 @@ static void clock_setup(void)
     rcc_periph_clock_enable(RCC_GPIOC);
 
     systick_set_clocksource(STK_CSR_CLKSOURCE_AHB);
-    systick_set_reload(48000000 / 1000 - 1);
+    systick_set_reload(48000000 / TICK_HZ - 1);
     systick_interrupt_enable();
     systick_counter_enable();
 }
@@ -77,7 +151,7 @@ static void relay_gpio_setup(void)
         gpio_mode_setup(port, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, pin);
         gpio_clear(port, pin);
     }
-    /* Heartbeat LED on PC13. */
+    /* Status LED on PC13, dimmed by sys_tick_handler. */
     gpio_mode_setup(GPIOC, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO13);
 }
 
@@ -209,6 +283,7 @@ int scpi_action_self_test(void)
 
 int main(void)
 {
+    enter_bootloader_if_requested();         /* before any clock/peripheral */
     clock_setup();
     relay_gpio_setup();
     relay_apply(0u);                         /* safe state: all released */
@@ -216,13 +291,11 @@ int main(void)
     usb_cdc_init(scpi_feed_byte);            /* RX bytes go to the parser */
     scpi_init(usb_cdc_write);                /* parser replies over CDC   */
 
-    uint32_t next_blink = 0u;
     for (;;) {
         usb_cdc_poll();
         scpi_poll();
-        if (milliseconds >= next_blink) {    /* 1 Hz heartbeat */
-            gpio_toggle(GPIOC, GPIO13);
-            next_blink = milliseconds + 500u;
+        if (dfu_pending) {
+            reboot_into_bootloader();
         }
     }
 }

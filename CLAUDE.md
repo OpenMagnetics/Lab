@@ -56,8 +56,11 @@ python hardware/relay-board-revB/simulate_calibration.py   # needs ngspice; geom
 # Firmware (arm-none-eabi + libopencm3 at $OPENCM3_DIR, default ../libopencm3,
 # built with: make -C libopencm3 TARGETS=stm32/f0)
 make -C firmware
-make -C firmware flash   # st-flash
+make -C firmware update  # normal path: SYST:DFU over USB + STM32CubeProgrammer (scripts/update_firmware.py)
+make -C firmware flash   # st-flash over SWD (J8)
 make -C firmware dfu     # dfu-util; hold BOOT0 while plugging USB
+# Blank boards: STM32F072 has no empty-flash DFU fallback; first flash needs BOOT0 high at
+# power-up (revB: bridge left pads of R4 and R3). Windows needs WinUSB on 0483:DF11 once (Zadig).
 ```
 
 ## Architecture

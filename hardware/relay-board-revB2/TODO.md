@@ -27,7 +27,12 @@ needs an ST-Link; it is not populated by JLC.
    `verify_board.py`, the BOM, and re-run generate_schematic → generate_pcb →
    route_pcb → verify_board → export_fab.
 
-**Related firmware item:** add a `SYST:DFU` SCPI command that jumps to the
-F072 system bootloader (0x1FFFC800), so already-flashed boards can be
-updated over USB with no button at all. The button is then only needed for
-first flash / recovery.
+**Related firmware item (done, firmware 1.1.0):** `SYST:DFU` reboots a flashed
+board into the ROM DFU bootloader (`RelayBoardController.enter_dfu()`), so
+updates need no strap; verified on hardware 2026-10-01. The button is only
+needed for first flash / recovery.
+
+## Status LED is too bright
+
+D1 is fed through R10 = 1k (~1.4 mA). Firmware 1.1.1 dims it with 2 % software
+PWM (10 kHz SysTick); raise R10 (e.g. 4.7k–10k) in revB2 so it isn't distracting without PWM.
