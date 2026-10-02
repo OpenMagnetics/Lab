@@ -20,6 +20,9 @@ pip install -r scripts/requirements.txt
 # Math/model tests (no instruments needed)
 python scripts/test_model.py
 
+# Calibration flow against fake instruments (relay check, MEAS restore, sidecar reuse)
+python scripts/test_calibration.py
+
 # Synthetic end-to-end pipeline check: builds a known DUT, runs the recipes
 python scripts/make_synthetic_dut.py
 
@@ -63,7 +66,7 @@ Three layers, bottom-up:
 
 ### Calibration is per signal path, at the isolation-relay contact plane
 
-The OSL plane sits at the isolation relay contacts: OPEN = all four iso relays energized, SHORT = additionally close the first HI terminal's LO relay, LOAD = a fifth DUT-less matrix column with an on-board 100 Ω 0.1 % standard (R5, K13/K14). Calibration files are per-path `.mcalx` under `scripts/calibrations/`, acquired automatically with the DUT clamped — there is no manual open/short/load fixture step and no `CALIBRATION_GROUPS` table anymore. Never call `relay_board.set_config()` directly from characterization code — use `MagneticCharacterizer._set_config()`, which handles recalibration on path changes.
+The OSL plane sits at the isolation relay contacts: OPEN = all four iso relays energized, SHORT = additionally close the first HI terminal's LO relay, LOAD = a fifth DUT-less matrix column with an on-board 100 Ω 0.1 % standard (R5, K13/K14). Calibration files are per-path `.mcalx` under `scripts/calibrations/` with a `.json` provenance sidecar (re-acquired after 24 h or when board, analyzer or drive level change), acquired automatically with the DUT clamped after a raw relay check of the three standards — there is no manual open/short/load fixture step and no `CALIBRATION_GROUPS` table anymore. Never call `relay_board.set_config()` directly from characterization code — use `MagneticCharacterizer._set_config()`, which handles recalibration on path changes.
 
 ### Running a characterization
 

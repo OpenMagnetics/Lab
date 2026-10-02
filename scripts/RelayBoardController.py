@@ -186,6 +186,7 @@ class RelayBoardController:
         self.timeout_ms = timeout_ms
         self.resource_string = com_port or self._auto_detect()
         self.visa_session = self._connect(self.resource_string)
+        self.identity = self.visa_session.query("*IDN?").strip()
         self.current_config = None
         self.current_path = None
         self.cal_mode = "MEAS"

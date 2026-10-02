@@ -15,6 +15,7 @@ independently (python test_model.py).
 """
 
 import argparse
+import datetime
 import json
 import math
 import os
@@ -97,30 +98,142 @@ class MagneticCharacterizer:
             self._ensure_calibrated(config_number)
         return config
 
+    #: A stored calibration older than this is re-acquired. OSL is automatic
+    #: and the DUT stays clamped, so re-running it is cheap next to measuring
+    #: against a fixture that drifted with temperature since yesterday.
+    MAX_CALIBRATION_AGE_HOURS = 24.0
+
+    #: Pre-OSL relay sanity check. At 1 kHz the three standards sit decades
+    #: apart whatever correction (or none) the instrument holds, so a stuck
+    #: K13/K14, a dead SHORT relay or a wrong R5 shows up before it can be
+    #: baked into a .mcalx. Bounds are deliberately loose: this catches
+    #: broken relays, not fixture error.
+    STANDARD_CHECK_BAND = (900.0, 1100.0)
+    STANDARD_CHECK_LOAD_TOLERANCE = 0.20
+    STANDARD_CHECK_OPEN_MIN_OHM = 10_000.0
+    STANDARD_CHECK_SHORT_MAX_OHM = 5.0
+
+    def _calibration_metadata_path(self, calibration_file):
+        return pathlib.Path(calibration_file).with_suffix(".json")
+
+    def _calibration_provenance(self):
+        """What a stored calibration is only valid for."""
+        return {
+            "relay_board": self.relay_board.identity,
+            "bode_100": self.bode_100.visa_session.query("*IDN?").strip(),
+            "source_power_dbm": self.bode_100.source_power,
+            "load_ohm": rbc.CALIBRATION_LOAD_OHM,
+        }
+
+    def _calibration_is_current(self, calibration_file):
+        """A .mcalx is reused only with a sidecar that matches this setup.
+
+        Files without one (acquired before provenance was recorded, or copied
+        in by hand) are re-acquired rather than trusted.
+        """
+        metadata_path = self._calibration_metadata_path(calibration_file)
+        if not (os.path.exists(calibration_file) and metadata_path.exists()):
+            return False
+        try:
+            metadata = json.loads(metadata_path.read_text())
+            acquired = datetime.datetime.fromisoformat(metadata["acquired"])
+        except (ValueError, KeyError) as error:
+            print(f"  Unreadable calibration metadata {metadata_path.name} ({error}); re-acquiring")
+            return False
+        age_hours = (datetime.datetime.now() - acquired).total_seconds() / 3600.0
+        if age_hours > self.MAX_CALIBRATION_AGE_HOURS:
+            print(f"  Calibration {os.path.basename(calibration_file)} is {age_hours:.0f} h old; re-acquiring")
+            return False
+        for key, value in self._calibration_provenance().items():
+            if metadata.get(key) != value:
+                print(f"  Calibration {os.path.basename(calibration_file)} was taken with "
+                      f"{key}={metadata.get(key)!r}, now {value!r}; re-acquiring")
+                return False
+        return True
+
+    def _standard_magnitude(self, mode):
+        self.relay_board.set_calibration_mode(mode)
+        start, stop = self.STANDARD_CHECK_BAND
+        data = self.bode_100.take_Z_phase_measurement(
+            start_frequency=start, stop_frequency=stop, number_of_measurement_cycles=1,
+            number_of_measurement_points=3, source_power_dbm=self.bode_100.source_power)
+        return float(data["magnitude"].median())
+
+    def _check_standards(self, path):
+        """Each standard must land in its own decade before OSL is trusted."""
+        readings = {mode: self._standard_magnitude(mode) for mode in ("OPEN", "SHORT", "LOAD")}
+        load = rbc.CALIBRATION_LOAD_OHM
+        problems = []
+        if abs(readings["LOAD"] - load) > self.STANDARD_CHECK_LOAD_TOLERANCE * load:
+            problems.append(f"LOAD reads {readings['LOAD']:.3g} ohm, expected ~{load:g} "
+                            "(K13/K14 stuck, or R5 wrong/missing)")
+        if readings["OPEN"] < self.STANDARD_CHECK_OPEN_MIN_OHM:
+            problems.append(f"OPEN reads {readings['OPEN']:.3g} ohm "
+                            "(an isolation relay did not open the DUT, or a standard relay is stuck closed)")
+        if readings["SHORT"] > self.STANDARD_CHECK_SHORT_MAX_OHM:
+            problems.append(f"SHORT reads {readings['SHORT']:.3g} ohm "
+                            "(the first HI terminal's LO crossbar relay did not close)")
+        if problems:
+            raise RuntimeError(f"Calibration standards failed the relay check on path {path}: "
+                               + "; ".join(problems))
+        print("    standards OK: " + ", ".join(f"{m} {v:.3g} ohm" for m, v in readings.items()))
+        return readings
+
     def _ensure_calibrated(self, config_number):
         calibration_file = str(self.calibrations_path / self.relay_board.calibration_name(config_number))
         path = rbc.signal_path(rbc.CONFIGS[config_number])
 
-        if os.path.exists(calibration_file):
+        if self._calibration_is_current(calibration_file):
             self.bode_100.calibrate(calibration_file, calibration_group=path)
             return
 
         print(f"  Calibrating path {path} (automatic, DUT stays clamped)")
-        self.bode_100.visa_session.write(f":SENS:CORR:LOAD {rbc.CALIBRATION_LOAD_OHM}")
-        self.bode_100.visa_session.write(":CALC:ZPAR:DEF Z")
-        for mode, command in (("OPEN", ":SENS:CORR:FULL:OPEN"),
-                              ("SHORT", ":SENS:CORR:FULL:SHOR"),
-                              ("LOAD", ":SENS:CORR:FULL:LOAD")):
-            self.relay_board.set_calibration_mode(mode)
-            self.bode_100.visa_session.write(command)
-            self.bode_100.visa_session.write("*WAI")
-            self.bode_100.visa_session.query("*OPC?")
-            print(f"    {mode} standard applied")
-        self.relay_board.set_calibration_mode("MEAS")
+        session = self.bode_100.visa_session
+        # The board must never be left with the DUT switched out, whatever
+        # fails below -- otherwise the next "measurement" is of a standard.
+        try:
+            standards = self._check_standards(path)
 
-        if not self.bode_100.is_calibrated():
-            raise RuntimeError(f"Automatic OSL failed for path {path}")
-        self.bode_100.visa_session.write(f':MMEM:STOR:CORR "{calibration_file}"')
+            # Calibrate at an explicit, recorded drive level rather than
+            # whatever the last sweep left on the source.
+            session.write(f":SOUR:POW {self.bode_100.source_power}")
+            session.write(f":SENS:CORR:LOAD {rbc.CALIBRATION_LOAD_OHM}")
+            session.write(":CALC:ZPAR:DEF Z")
+            for mode, command in (("OPEN", ":SENS:CORR:FULL:OPEN"),
+                                  ("SHORT", ":SENS:CORR:FULL:SHOR"),
+                                  ("LOAD", ":SENS:CORR:FULL:LOAD")):
+                self.relay_board.set_calibration_mode(mode)
+                session.write(command)
+                session.write("*WAI")
+                session.query("*OPC?")
+                print(f"    {mode} standard applied")
+
+            if not self.bode_100.is_calibrated():
+                raise RuntimeError(f"Automatic OSL failed for path {path}")
+
+            # Re-actuate and re-read through the new correction. LOAD must
+            # come back as the defined value (catches noise and unstable
+            # contacts); the SHORT residual is one sample of the contact
+            # repeatability that sits outside the OSL plane.
+            self.relay_board.set_calibration_mode("OPEN")
+            self.relay_board.set_calibration_mode("LOAD")
+            self.bode_100._verify_load_standard(rbc.CALIBRATION_LOAD_OHM, max_attempts=3)
+            self.relay_board.set_calibration_mode("OPEN")
+            short_residual = self._standard_magnitude("SHORT")
+            print(f"    SHORT after re-actuation: {short_residual*1e3:.1f} mohm")
+        finally:
+            try:
+                self.relay_board.set_calibration_mode("MEAS")
+            except Exception as error:
+                print(f"  !! could not return the relay board to MEAS: {error}")
+
+        session.write(f':MMEM:STOR:CORR "{calibration_file}"')
+        metadata = dict(self._calibration_provenance(),
+                        acquired=datetime.datetime.now().isoformat(timespec="seconds"),
+                        signal_path=path,
+                        standards_raw_ohm=standards,
+                        short_residual_ohm=short_residual)
+        self._calibration_metadata_path(calibration_file).write_text(json.dumps(metadata, indent=2))
         self.bode_100.current_calibration_group = path
         self.bode_100.current_calibration_file = calibration_file
         print(f"    stored {os.path.basename(calibration_file)}")
