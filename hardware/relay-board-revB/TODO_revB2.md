@@ -11,7 +11,11 @@ these are for the B2 respin and the software that drives it.
   side) sit outside the OSL plane, and contact resistance moves on every
   actuation. Rac in the mΩ range is out of scope until separate
   force/sense relays reach the clamps (or a dedicated Kelvin clamp pair
-  bypasses the matrix for Rac work).
+  bypasses the matrix for Rac work). Starting point: each DUT clamp is
+  already a 2-position block, but rev B ties both pads to one net
+  (schematic label "force + spare/sense" is aspirational). Splitting pad 2
+  onto its own sense net gives the clamp-side half of a Kelvin connection
+  with no new connector.
 - [ ] **Make the SHORT follow the DUT path.** Today SHORT closes the first
   HI terminal's LO relay, so it skips the LO terminal's bus and contact that
   the DUT path includes; that series impedance is counted as DUT. Options:
