@@ -109,9 +109,11 @@ def log_frequency_axis(axis):
 # ------------------------------------------------------------------ pages
 
 def page_summary(pdf, state, results, differential, warnings, calibration_meta):
+    description = state.get("description")
     figure = new_page(state, f"Magnetic characterization — {state['reference']}",
-                      f"Omicron Bode 100 + OpenMagnetics relay board rev B · automatic per-path OSL · "
-                      f"report generated {datetime.datetime.now():%Y-%m-%d %H:%M}")
+                      (f"DUT: {description}  ·  " if description else "")
+                      + f"Bode 100 + relay board rev B · automatic per-path OSL · "
+                      f"report {datetime.datetime.now():%Y-%m-%d %H:%M}")
     magnetic = results.get("magnetic", {})
     losses = results.get("losses", {})
     estat = differential.get("electrostatic", {})
@@ -343,7 +345,7 @@ def page_reciprocity(pdf, state, reference):
         "6–7 % and smooth below 10 MHz: the series impedance of the link path that shorts the far winding differs between "
         "the two directions (outside the OSL plane — rev B2 TODO 'make the SHORT follow the DUT path'; the short-pair page "
         "measures it at 26–59 nH). A relay in the wrong state would give errors of orders of magnitude. Above 10 MHz the "
-        "windings stop being lumped and the identity no longer strictly applies."], width=175)
+        "uncalibrated path inductance in the shorted states grows in importance and the identity degrades."], width=175)
     pdf.savefig(figure)
     plt.close(figure)
 
@@ -413,8 +415,8 @@ def page_electrostatic(pdf, state, reference, differential):
         "Ground coupling is negligible, so the ground-free [BLA94] model is",
         "appropriate for this DUT on this fixture. States 18/19 carry the",
         "floating LINK rail (~0.4 pF), which is why they sit above 17.",
-        "Above ~10 MHz C33 rises: the shorted windings' own conductor",
-        "inductance (metres of wire) in series with C33.",
+        "Above ~10 MHz C33 rises as if ~100 nH were in series: the",
+        "uncalibrated arms/columns (~40-60 nH) plus the winding path.",
     ], size=8)
     pdf.savefig(figure)
     plt.close(figure)
@@ -447,7 +449,7 @@ def page_open_family(pdf, state, reference, differential, before):
         f"(BC + AD)/2 − BD = {(od['BC']['value'] + od['AD']['value'])/2:.2f} pF vs C33 "
         f"{differential['C33']['forward_pf']:.2f}: ~1 pF per isolated clamp.",
         "Below ~0.5 MHz the core (≈1 µF-equivalent) drifts 0.07 % between",
-        "sweeps and dominates; above ~12 MHz the windings stop being lumped.",
+        "sweeps and dominates; above ~12 MHz series path inductance enters.",
     ]
     if before:
         lines += ["", "**Before the fixture fixes (same DUT)"] + [
@@ -529,7 +531,7 @@ def page_self_capacitance(pdf, state, reference, differential):
         "rising to a plateau. A core term alone can only make it rise; the",
         "fall is consistent with MnZn ferrite whose permittivity relaxes in",
         "the MHz range (turn-to-core capacitance follows it), plus the",
-        "windings ceasing to be lumped above ~10 MHz.",
+        "series path inductance becoming significant above ~10 MHz.",
         "",
         "**Consequence",
         "C11, C22 and C12 are not frequency-independent properties of this",
@@ -640,6 +642,9 @@ def main():
 
     destination = pathlib.Path(arguments.out) if arguments.out else OUTPUT / f"{reference}_report.pdf"
     state = {"page": 0, "reference": reference}
+    dut_path = OUTPUT / f"{reference}_dut.json"
+    if dut_path.exists():
+        state["description"] = json.loads(dut_path.read_text()).get("description")
     before = before_differences(arguments.before) if arguments.before else None
     with PdfPages(destination) as pdf:
         page_summary(pdf, state, results, differential, warnings, calibration_meta)

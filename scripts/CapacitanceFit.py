@@ -666,8 +666,9 @@ def magnetic_summary(result):
 #
 # The global fit above is exact for a lumped DUT and is validated on synthetic
 # data (test_capacitance_fit.py). A real winding on MnZn ferrite is not fully
-# lumped: the turn-to-core capacitance follows the ferrite's permittivity, and
-# metres of wire start behaving as a line above ~10 MHz. The estimators below
+# lumped: windings sit directly on a high-permittivity, dispersive dielectric
+# (MnZn ferrite), so turn-to-core capacitance changes with frequency, and the
+# fixture path adds tens of nH above ~10 MHz. The estimators below
 # use only differences in which the core (open family) or the leakage (short
 # pairs) cancels at every frequency, plus electrostatic-only states, so they
 # hold regardless.

@@ -70,6 +70,9 @@ class MagneticCharacterizer:
         self.offline = False
         self.results = {}
         self.warnings = []
+        # Sweeps taken in this session, keyed by everything that defines them,
+        # so two recipes asking for the same sweep share one acquisition.
+        self._session_sweeps = {}
 
         try:
             kwargs = {"SCPI_server_IP": bode_ip} if bode_ip else {}
@@ -284,6 +287,14 @@ class MagneticCharacterizer:
         if drive_dbm is None:
             drive_dbm = self.DRIVE_LOW_BAND_DBM if start < 1000 else self.DRIVE_HIGH_BAND_DBM
 
+        # Recipes overlap (inductance and losses both need configs 1 and 3).
+        # Re-measuring used to overwrite the CSV another recipe had already
+        # analysed, so a later --cache run saw a different sweep than the live
+        # one and gave slightly different results (eta 1.0032 vs 1.0037).
+        key = (config_number, kind, start, stop, cycles, points, drive_dbm)
+        if key in self._session_sweeps:
+            return self._session_sweeps[key]
+
         self._set_config(config_number)
         method = {"RL": self.bode_100.take_Rs_Ls_measurement,
                   "Z": self.bode_100.take_Z_phase_measurement,
@@ -294,6 +305,7 @@ class MagneticCharacterizer:
                       number_of_measurement_points=points,
                       source_power_dbm=drive_dbm)
         data.to_csv(path, index=False)
+        self._session_sweeps[key] = data
         return data
 
     def value_at(self, data, frequency, parameter="inductance", tolerance=0.05):
@@ -328,8 +340,8 @@ class MagneticCharacterizer:
         print("\n-- Switching self-test (reciprocity) --")
         sweeps = {name: self.measure(number, "Z", allow_use_cache, band=self.RESONANCE_BAND)
                   for name, number in (("Z0", 1), ("Zsc", 2), ("Z0p", 3), ("Zscp", 4))}
-        # Judged below RECIPROCITY_MAX_HZ: above ~10 MHz metres of winding wire
-        # stop being lumped and the two-port identity no longer strictly holds.
+        # Judged below RECIPROCITY_MAX_HZ: above ~10 MHz the uncalibrated path
+        # inductance and the ferrite's dispersive capacitance dominate the shorts.
         _, _, merged = tm.check_reciprocity(sweeps["Z0"], sweeps["Z0p"], sweeps["Zsc"], sweeps["Zscp"])
         merged = merged[merged.frequency <= self.RECIPROCITY_MAX_HZ]
         worst = float(merged.relative_error.max())
@@ -499,8 +511,9 @@ class MagneticCharacterizer:
         The [BLA94] resonance route (characterize_capacitance_resonance) needs
         L at each resonance; on ferrite the first open-circuit resonance sits
         where mu is already dispersive and lossy, and the short-circuit
-        resonances sit at or past 50 MHz where metres of winding wire are no
-        longer lumped. What this bench measures robustly instead:
+        resonances sit at or past the analyzer's 50 MHz, where the fixture's
+        tens of nH matter as much as the leakage. What this bench measures
+        robustly instead:
 
           * C33 directly, both directions, and each winding's capacitance to
             ground (configs 7, 16-19: windings shorted, no magnetics at all);
@@ -770,7 +783,17 @@ def main():
                         help="also run the multi-gap AC resistance recipe (needs manual re-gapping)")
     parser.add_argument("--gaps", nargs="*", default=None, help="gap labels for --ac-resistance")
     parser.add_argument("--no-auto-calibrate", action="store_true")
+    parser.add_argument("--describe", default=None,
+                        help="free-text DUT description (core, material, turns...), stored in "
+                             "output/{reference}_dut.json and shown in the report")
     arguments = parser.parse_args()
+
+    if arguments.describe:
+        here = pathlib.Path(__file__).parent.resolve() / "output"
+        here.mkdir(parents=True, exist_ok=True)
+        (here / f"{arguments.reference}_dut.json").write_text(json.dumps(
+            {"reference": arguments.reference, "description": arguments.describe,
+             "recorded": datetime.datetime.now().isoformat(timespec="seconds")}, indent=2))
 
     characterizer = MagneticCharacterizer(
         reference=arguments.reference, relay_board_port=arguments.port,
