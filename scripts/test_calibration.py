@@ -84,6 +84,9 @@ class FakeBode:
     def is_calibrated(self):
         return self.osl_succeeds
 
+    def _configure_sweep(self, *_):
+        self.visa_session.write(":SENS:Z:METH IAD")
+
     def take_Z_phase_measurement(self, **_):
         return pandas.DataFrame({"measurement_index": 0, "frequency": [900.0, 1000.0, 1100.0],
                                  "magnitude": self.board.presented_ohm(), "phase": 0.0})
@@ -193,8 +196,50 @@ def test_staleness():
         check("corrupt sidecar -> re-acquire", not c._calibration_is_current(str(mcalx)))
 
 
+class FakeColdBode(FakeBode):
+    """No correction active until the OSL commands run, and IAD sweeps hang
+    without one -- the real Bode 100 on the first path of a session."""
+
+    def __init__(self, board):
+        super().__init__(board)
+        self.active = False
+
+    def is_calibrated(self):
+        self.active = self.active or ":SENS:CORR:FULL:LOAD" in self.visa_session.writes
+        return self.active
+
+    def take_Z_phase_measurement(self, **kwargs):
+        if not self.is_calibrated():
+            raise RuntimeError("IAD sweep with no active correction would hang")
+        return super().take_Z_phase_measurement(**kwargs)
+
+
+def test_no_prior_correction():
+    for broken in (None, "LOAD", "SHORT", "OPEN"):
+        print(f"\nAutomatic OSL, no correction active yet, broken={broken}")
+        with tempfile.TemporaryDirectory() as directory:
+            board = FakeBoard(broken=broken)
+            bode = FakeColdBode(board)
+            c = characterizer(directory, board, bode)
+            try:
+                c._ensure_calibrated(1)
+                raised = None
+            except RuntimeError as error:
+                raised = str(error)
+            if broken is None:
+                check("calibrates without sweeping uncorrected", raised is None, raised or "")
+                metadata = json.loads((pathlib.Path(directory) / "relay_board_A-B.json").read_text())
+                check("records check was through fresh OSL",
+                      metadata["standards_checked"] == "through_fresh_osl")
+            else:
+                check("refuses to store", raised is not None and broken in raised and not stored_files(bode),
+                      raised or "no error")
+            check("board left in MEAS", board.mode == "MEAS", board.mode)
+
+
 if __name__ == "__main__":
-    for test in (test_good_path, test_broken_relays, test_osl_failure_restores_meas, test_staleness):
+    for test in (test_good_path, test_broken_relays, test_osl_failure_restores_meas, test_staleness,
+                 test_no_prior_correction):
         test()
     print("\n" + "=" * 68)
     print(f"{'all passed' if not FAILURES else f'{len(FAILURES)} FAILED: ' + ', '.join(FAILURES)}")

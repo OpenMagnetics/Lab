@@ -105,7 +105,21 @@ static uint32_t compose_word(void)
     uint32_t word = (current_config >= 1u && current_config <= CONFIG_COUNT)
                         ? config_table[current_config - 1u] : 0u;
 
-    if (cal_mode != CAL_MODE_MEAS) {
+    if (cal_mode == CAL_MODE_MEAS) {
+        if (word == 0u) {
+            return word;                    /* no config: everything released */
+        }
+        /* A terminal on no rail must float: isolate it so its column bus
+         * (open matrix contacts + copper, a few pF to HI and LO) does not
+         * load the DUT node. Calibration isolates every terminal, so this
+         * capacitance is never in the OSL and would land in the result. */
+        for (uint32_t terminal = 0u; terminal < 4u; terminal++) {
+            uint32_t column = 7u << MATRIX_BIT(terminal, 0u);
+            if ((word & column) == 0u) {
+                word |= 1u << (BIT_ISOLATE_A + terminal);
+            }
+        }
+    } else {
         word |= MASK_ISOLATION;             /* DUT out; open contact = OPEN */
         if (cal_mode == CAL_MODE_SHORT) {
             /* Bridge the rails through the first HI terminal's bus by also

@@ -25,6 +25,7 @@ import numpy
 import pandas
 
 import Bode100Analyzer
+import CapacitanceFit as cfit
 import RelayBoardController as rbc
 import TransformerModel as tm
 
@@ -39,6 +40,13 @@ class MagneticCharacterizer:
 
     #: Resonance band for the capacitance work.
     RESONANCE_BAND = (10_000.0, 40_000_000.0)
+
+    #: Capacitance-grade sweep ("Zhd"): the analyzer's full 50 MHz, dense, and
+    #: four cycles so every point carries its own repeatability. The
+    #: differential estimators need the whole band and the cycle scatter.
+    CAPACITANCE_SWEEP = dict(band=(10_000.0, 50_000_000.0), points=801, cycles=4,
+                             drive_dbm=13)
+    CAPACITANCE_CONFIGS = (7, 16, 17, 18, 19, 1, 8, 10, 12, 13, 3, 2, 9, 11, 4, 14, 15, 5, 6)
 
     #: [COG94] III: lower drive at low frequency to avoid core saturation,
     #: higher at high frequency for signal-to-noise. Rev A used a fixed 13 dBm
@@ -163,7 +171,8 @@ class MagneticCharacterizer:
         """Each standard must land in its own decade before OSL is trusted."""
         readings = {mode: self._standard_magnitude(mode) for mode in ("OPEN", "SHORT", "LOAD")}
         load = rbc.CALIBRATION_LOAD_OHM
-        problems = []
+        problems = [f"{mode} reads {value!r} (degenerate standards make the OSL singular)"
+                    for mode, value in readings.items() if not math.isfinite(value)]
         if abs(readings["LOAD"] - load) > self.STANDARD_CHECK_LOAD_TOLERANCE * load:
             problems.append(f"LOAD reads {readings['LOAD']:.3g} ohm, expected ~{load:g} "
                             "(K13/K14 stuck, or R5 wrong/missing)")
@@ -192,8 +201,22 @@ class MagneticCharacterizer:
         # The board must never be left with the DUT switched out, whatever
         # fails below -- otherwise the next "measurement" is of a standard.
         try:
-            standards = self._check_standards(path)
+            # In IAD mode the Bode 100 refuses to sweep without an active
+            # correction ("Calibration must be active" -- the data query just
+            # hangs), so the raw check needs one already on the instrument.
+            # On the first path of a session there is none: check the
+            # standards through the fresh OSL instead, before it is stored.
+            check_before_osl = self.bode_100.is_calibrated()
+            standards = self._check_standards(path) if check_before_osl else None
 
+            # The correction belongs to the measurement method active when it
+            # is acquired: a fresh server session starts in one-port reflection
+            # (S11/P1R), and an OSL taken there leaves IAD with no correction.
+            # Put the instrument in the IAD impedance setup first. The FULL
+            # correction is full-range, so the band chosen here does not limit
+            # later sweeps.
+            start, stop = self.STANDARD_CHECK_BAND
+            self.bode_100._configure_sweep(start, stop, 3, self.bode_100.source_power)
             # Calibrate at an explicit, recorded drive level rather than
             # whatever the last sweep left on the source.
             session.write(f":SOUR:POW {self.bode_100.source_power}")
@@ -210,6 +233,8 @@ class MagneticCharacterizer:
 
             if not self.bode_100.is_calibrated():
                 raise RuntimeError(f"Automatic OSL failed for path {path}")
+            if standards is None:
+                standards = self._check_standards(path)
 
             # Re-actuate and re-read through the new correction. LOAD must
             # come back as the defined value (catches noise and unstable
@@ -232,6 +257,7 @@ class MagneticCharacterizer:
                         acquired=datetime.datetime.now().isoformat(timespec="seconds"),
                         signal_path=path,
                         standards_raw_ohm=standards,
+                        standards_checked="before_osl" if check_before_osl else "through_fresh_osl",
                         short_residual_ohm=short_residual)
         self._calibration_metadata_path(calibration_file).write_text(json.dumps(metadata, indent=2))
         self.bode_100.current_calibration_group = path
@@ -240,7 +266,11 @@ class MagneticCharacterizer:
 
     def measure(self, config_number, kind="RL", allow_use_cache=False, band=None,
                 cycles=2, points=201, drive_dbm=None):
-        """Acquire (or load) one sweep. kind is 'RL', 'Z' or 'Cs'."""
+        """Acquire (or load) one sweep. kind is 'RL', 'Z', 'Cs' or 'Zhd'
+        (capacitance-grade Z: CAPACITANCE_SWEEP settings)."""
+        if kind == "Zhd":
+            sweep = self.CAPACITANCE_SWEEP
+            band, points, cycles, drive_dbm = sweep["band"], sweep["points"], sweep["cycles"], sweep["drive_dbm"]
         path = self._cache_path(config_number, kind)
         if allow_use_cache and path.exists():
             return pandas.read_csv(path)
@@ -257,6 +287,7 @@ class MagneticCharacterizer:
         self._set_config(config_number)
         method = {"RL": self.bode_100.take_Rs_Ls_measurement,
                   "Z": self.bode_100.take_Z_phase_measurement,
+                  "Zhd": self.bode_100.take_Z_phase_measurement,
                   "Cs": self.bode_100.take_Cs_measurement}[kind]
         data = method(start_frequency=start, stop_frequency=stop,
                       number_of_measurement_cycles=cycles,
@@ -297,16 +328,34 @@ class MagneticCharacterizer:
         print("\n-- Switching self-test (reciprocity) --")
         sweeps = {name: self.measure(number, "Z", allow_use_cache, band=self.RESONANCE_BAND)
                   for name, number in (("Z0", 1), ("Zsc", 2), ("Z0p", 3), ("Zscp", 4))}
-        passed, worst, _ = tm.check_reciprocity(sweeps["Z0"], sweeps["Z0p"],
-                                                sweeps["Zsc"], sweeps["Zscp"])
+        # Judged below RECIPROCITY_MAX_HZ: above ~10 MHz metres of winding wire
+        # stop being lumped and the two-port identity no longer strictly holds.
+        _, _, merged = tm.check_reciprocity(sweeps["Z0"], sweeps["Z0p"], sweeps["Zsc"], sweeps["Zscp"])
+        merged = merged[merged.frequency <= self.RECIPROCITY_MAX_HZ]
+        worst = float(merged.relative_error.max())
+        passed = worst <= 0.05
         self.results["reciprocity_error"] = worst
         self.results["reciprocity_passed"] = passed
         if passed:
             print(f"  PASS -- worst deviation {worst*100:.2f}%")
+        elif worst <= self.RECIPROCITY_FIXTURE_LIMIT:
+            # A relay in the wrong state swaps an open for a short: orders of
+            # magnitude, not percent. A few percent, smooth in frequency, is
+            # the link path that shorts the far winding: it sits outside the
+            # OSL plane and differs between the two directions (rev B2 TODO
+            # "make the SHORT follow the DUT path"; ~26-59 nH on rev B).
+            self.warn(f"Reciprocity off by {worst*100:.1f}% (<= {self.RECIPROCITY_MAX_HZ/1e6:g} MHz): "
+                      "switching is correct; this is the uncalibrated link-path impedance in the "
+                      "shorted states, which biases Lsc/ls by about that much.")
         else:
             self.warn(f"RECIPROCITY FAILED ({worst*100:.1f}%): a relay is probably in the "
                       "wrong state, or the DUT is non-linear. Results below are suspect.")
         return passed
+
+    #: Upper frequency for the reciprocity identity (lumped windings).
+    RECIPROCITY_MAX_HZ = 10e6
+    #: Below this, a reciprocity error is fixture link impedance, not switching.
+    RECIPROCITY_FIXTURE_LIMIT = 0.20
 
     def verify_linearity(self, config_number=1, allow_use_cache=False):
         """[COG94] III: acquire twice at two drive levels to prove linearity."""
@@ -445,6 +494,64 @@ class MagneticCharacterizer:
         return losses
 
     def characterize_capacitance(self, allow_use_cache=False):
+        """Capacitances from differences that cancel the core or the leakage.
+
+        The [BLA94] resonance route (characterize_capacitance_resonance) needs
+        L at each resonance; on ferrite the first open-circuit resonance sits
+        where mu is already dispersive and lossy, and the short-circuit
+        resonances sit at or past 50 MHz where metres of winding wire are no
+        longer lumped. What this bench measures robustly instead:
+
+          * C33 directly, both directions, and each winding's capacitance to
+            ground (configs 7, 16-19: windings shorted, no magnetics at all);
+          * C13 + C23 from open-circuit link differences, where the core term
+            is common and cancels at every frequency;
+          * C13 and C23 separately from pairs of shorted states that share one
+            leakage, which cancels at every frequency;
+          * the self-capacitance seen across the windings as a SPECTRUM, with
+            its maximum as a lower bound -- C11, C22 and C12 separately are not
+            identifiable without a model of the ferrite (CapacitanceFit's
+            global fit does that for a lumped DUT and says so for this one).
+
+        See CapacitanceFit.differential_summary.
+        """
+        print("\n-- Capacitances (differential) --")
+        for number in self.CAPACITANCE_CONFIGS:
+            self.measure(number, "Zhd", allow_use_cache)
+        summary = cfit.differential_summary(str(self.output_path), self.reference)
+        estat = summary["electrostatic"]
+        spectra = summary.pop("open_spectra")
+        f = spectra["frequency"]
+        _, Y_open = cfit.load_admittance(str(self.output_path), self.reference, cfit.OPEN_REFERENCE)
+        c_open = cfit.effective_capacitance(f, Y_open).mean(axis=0) / cfit.PICO
+        window = (f >= 1e6) & (f <= 15e6)
+        summary["self_capacitance_lower_bound_pf"] = float(c_open[window].max())
+        summary["self_capacitance_at_pf"] = {
+            f"{x/1e6:g} MHz": float(c_open[numpy.argmin(numpy.abs(f - x))]) for x in (3e6, 5e6, 10e6, 20e6, 30e6)}
+
+        print(f"  C33 (interwinding)       {summary['C33']['forward_pf']:.2f} pF "
+              f"(reverse {summary['C33']['reverse_pf']:.2f})")
+        print(f"  to ground                primary {estat['C_primary_ground_pf']:.2f}, "
+              f"secondary {estat['C_secondary_ground_pf']:.2f} pF")
+        print(f"  C13                      {summary['C13']['value']:.2f} +- {summary['C13']['spread']:.2f} pF")
+        print(f"  C23                      {summary['C23']['value']:.2f} +- {summary['C23']['spread']:.2f} pF")
+        print(f"  C13+C23  open / shorts   {summary['u_open']['value']:.2f} / {summary['u_short']['value']:.2f} pF")
+        print(f"  self-C across windings   >= {summary['self_capacitance_lower_bound_pf']:.2f} pF "
+              "(open-circuit, core term removed only as a bound)")
+
+        fixture_check = summary["open_differences"]["AC"]["value"]
+        if abs(fixture_check) > 0.5:
+            self.warn(f"AC-BD open difference is {fixture_check:.2f} pF; it is zero for any lumped "
+                      "DUT, so the fixture is loading floating terminals.")
+        gap = abs(summary["u_open"]["value"] - summary["u_short"]["value"])
+        if gap > 1.0:
+            self.warn(f"C13+C23 disagrees by {gap:.1f} pF between the open and the shorted "
+                      "families -- the six-capacitance lumped model only approximately holds "
+                      "for this part; treat C13/C23 to about that level.")
+        self.results["capacitance_differential"] = summary
+        return summary
+
+    def characterize_capacitance_resonance(self, allow_use_cache=False):
         """[BLA94] Table 1: the six capacitance coefficients from resonances."""
         print("\n-- Capacitances --")
         magnetic = self.results.get("magnetic") or self.characterize_inductance(allow_use_cache)
@@ -609,6 +716,7 @@ class MagneticCharacterizer:
         magnetic = self.results.get("magnetic", {})
         losses = self.results.get("losses", {})
         capacitance = self.results.get("capacitance", {}).get("coefficients", {})
+        differential = self.results.get("capacitance_differential", {})
 
         if magnetic:
             print(f"  Coupling k               {magnetic['k']:.5f}")
@@ -621,6 +729,11 @@ class MagneticCharacterizer:
                   f"({losses['r2_primary_referred']*1e3:.2f} referred to primary)")
             if losses.get("Rp"):
                 print(f"  Core loss Rp             {losses['Rp']:.1f} ohm")
+        if differential:
+            print(f"  Interwinding C33         {differential['C33']['forward_pf']:.2f} pF")
+            print(f"  C13 / C23                {differential['C13']['value']:.2f} / "
+                  f"{differential['C23']['value']:.2f} pF")
+            print(f"  Self-C across windings   >= {differential['self_capacitance_lower_bound_pf']:.2f} pF")
         if capacitance:
             print(f"  Interwinding C33         {capacitance['C33']*1e12:.2f} pF")
             print(f"  Primary self C11         {capacitance['C11']*1e12:.2f} pF")

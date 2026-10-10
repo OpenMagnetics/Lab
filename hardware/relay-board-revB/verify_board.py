@@ -132,12 +132,8 @@ class Union:
 def relay_word_for_config(config):
     """Which relays are energized for a configuration -- the same rule the
     firmware implements: matrix bit for every (terminal, rail) assignment."""
-    energized = set()
-    for rail in ("HI", "LO", "LINK"):
-        for terminal in config[rail]:
-            bit = rbc.MATRIX_BITS[(terminal, rail)]
-            energized.add(f"K{bit + 1}")
-    return energized
+    word = rbc.measurement_word(config)
+    return {f"K{bit + 1}" for bit in range(rbc.RELAY_COUNT) if (word >> bit) & 1}
 
 
 def simulate_config(config, pin_to_net):
@@ -186,6 +182,19 @@ def check_configs(pin_to_net):
         if link and (union.together("/RAIL_LINK", "/RAIL_HI")
                      or union.together("/RAIL_LINK", "/RAIL_LO")):
             problems.append("LINK rail touches a measurement rail")
+
+        # Floating terminals must be cut from their column bus too, or the
+        # column's uncalibrated capacitance loads the DUT node.
+        for terminal in rbc.floating_terminals(config):
+            if union.together(f"/DUT_{terminal}", f"/T{terminal}"):
+                problems.append(f"floating DUT_{terminal} still on its column bus")
+
+        # Intent, not just connectivity: link_XY_* must join X and Y. Config 8
+        # once put D alone on LINK and passed every check above.
+        if config["name"].startswith("link_"):
+            first, second = config["name"].split("_")[1]
+            if not union.together(f"/DUT_{first}", f"/DUT_{second}"):
+                problems.append(f"{config['name']} does not join {first}-{second}")
 
         if problems:
             all_ok = False

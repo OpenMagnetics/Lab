@@ -80,6 +80,11 @@ class MagneticMeasurer:
         session.timeout = self.SCPI_timeout
         session.read_termination = "\n"
         print(f"Connected: {session.query('*IDN?')}")
+        # The OMICRON SCPI server answers *IDN? itself but only opens and
+        # initializes the USB instrument on the first device command (~2-3 s).
+        # Writes that arrive during that window are silently dropped, so force
+        # the initialization with a query before any setting is sent.
+        session.query(":SENS:FREQ:STOP?")
         return session
 
     def close_visa_session(self):

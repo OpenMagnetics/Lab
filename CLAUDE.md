@@ -68,6 +68,15 @@ Three layers, bottom-up:
 
 The OSL plane sits at the isolation relay contacts: OPEN = all four iso relays energized, SHORT = additionally close the first HI terminal's LO relay, LOAD = a fifth DUT-less matrix column with an on-board 100 Ω 0.1 % standard (R5, K13/K14). Calibration files are per-path `.mcalx` under `scripts/calibrations/` with a `.json` provenance sidecar (re-acquired after 24 h or when board, analyzer or drive level change), acquired automatically with the DUT clamped after a raw relay check of the three standards — there is no manual open/short/load fixture step and no `CALIBRATION_GROUPS` table anymore. Never call `relay_board.set_config()` directly from characterization code — use `MagneticCharacterizer._set_config()`, which handles recalibration on path changes.
 
+### Relay driving and the SCPI server (bench notes)
+
+- `RelayBoardController.set_config()` sets every relay with `RELAY n,s` and reads the word back; it does not use `CONF:MEAS`, so the Python `CONFIGS` table is authoritative regardless of the flashed firmware. `measurement_word()` also energizes the isolation relay of every FLOATING terminal (otherwise its column bus loads the DUT with uncalibrated pF). Configs 16-19 are electrostatic-only states (windings shorted on themselves) that exist only in the Python table.
+- The Bode 100 over USB needs OMICRON's `ScpiRunner.exe` (`C:\Program Files\OMICRON\BodeAnalyzerSuite`); it exits on stdin EOF, so keep stdin open (`tail -f /dev/null | ScpiRunner.exe -i 127.0.0.1 -p 5025 -s <serial>`) and pass `--bode-ip 127.0.0.1`. It drops writes sent before the instrument is initialized (the driver warms up with a query) and, in IAD mode, will not sweep without an active correction (the data query just hangs).
+
+### Capacitance analysis
+
+`characterize_capacitance` takes dense `Zhd` sweeps (10 kHz-50 MHz, 801 pts x 4 cycles) and runs `CapacitanceFit.differential_summary`: C33 direct (7, 16), ground (17-19), core-free open-link differences, and leakage-cancelling short pairs for C13/C23. The [BLA94] resonance solve is kept as `characterize_capacitance_resonance`. `CapacitanceFit.fit` is a global nodal fit (variable projection, core free per frequency) validated by `test_capacitance_fit.py`; on ferrite parts whose self-capacitance is dispersive it does not fit, and its C11/C12/C22 must not be reported. `make_report.py <reference>` builds the PDF report from cache.
+
 ### Running a characterization
 
 `MagneticCharacterizer.py`'s `__main__` block is the UI: a stack of commented-out constructor calls (one per DUT reference) and method calls. Edit which lines are uncommented rather than adding an argument parser, unless asked to.

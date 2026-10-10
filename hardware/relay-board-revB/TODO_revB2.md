@@ -29,6 +29,22 @@ these are for the B2 respin and the software that drives it.
 
 ## Software (applies to rev B already)
 
+### Bench findings 2026-10-10 (DUT_20261010, 1:1 252 uH MnZn transformer)
+
+- [x] **Config 8 (link_BD_open) never joined B-D** (D alone on LINK). Fixed in
+  the Python table and `relay_map.h`; `verify_board.py` now checks link intent.
+- [x] **Floating terminals loaded the DUT with their column bus** (~8 pF,
+  uncalibrated). Driver and firmware source isolate floating terminals in MEAS;
+  OSL state unchanged, so stored calibrations stay valid.
+- [x] Driver drives relays individually (`RELAY n,s` + readback) instead of
+  `CONF:MEAS`, so it works with any flashed table.
+- [ ] **Flash firmware 1.2.0** (board reports 1.1.1). Needs arm-none-eabi.
+- [ ] **Isolated-clamp capacitance** (~1 pF to HI and to GND per floating
+  terminal) remains; it is what is left between the open-family links and
+  direct C33 (+4 pF on a 1:1 part). Candidate for the clamp-plane residual step.
+- [ ] Link-path series inductance measured: 26 nH (9 vs 11) and 59 nH (14 vs 15).
+  This is the reciprocity error (6-8 % below 10 MHz) and biases ls by about that.
+
 ### Calibration
 
 - [ ] **Clamp-plane residual compensation** *(bench: needs the board + Bode)*. Per signal path, optional

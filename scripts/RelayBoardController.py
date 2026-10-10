@@ -105,7 +105,10 @@ CONFIGS = {c["number"]: c for c in [
     # With the secondary SHORTED, linking B-D and B-C give the same topology,
     # as do A-C and A-D. [BLA94] Table 1 agrees: their C1+C3 columns are equal
     # in each pair. Rev A spent four configurations on what are two states.
-    _config(8, "link_BD_open", "A", "B", ("D",),
+    # B and D joined on LO. Firmware <= 1.1.1 put D alone on LINK here, which
+    # never joined B-D: the sweep was a floating-secondary Z0 plus the LINK
+    # rail's capacitance. The driver now drives every relay itself.
+    _config(8, "link_BD_open", "A", ("B", "D"), (),
             "B-D linked, secondary open"),
     _config(9, "link_BD_short", "A", ("B", "C", "D"), (),
             "B-D (or B-C) linked, secondary shorted"),
@@ -130,6 +133,22 @@ CONFIGS = {c["number"]: c for c in [
     _config(15, "link_AC_short_sec", ("A", "B", "C"), "D", (),
             "A-C linked and primary shorted, measured from the secondary "
             "-- redundant with config 11"),
+
+    # --- electrostatic-only states: each winding shorted on itself --------
+    # No magnetics at all (V1 = V2 = 0), so these are clean absolute
+    # capacitances. The Bode LO side is ground: together with config 7 they
+    # separate the interwinding capacitance from each winding's capacitance
+    # to ground, which the ground-free [BLA94] model does not have and which
+    # otherwise biases every link sweep. Driven by the Python relay table
+    # (firmware <= 1.2 has no CONF:MEAS entry for 16-19).
+    _config(16, "C33_rev", ("C", "D"), ("A", "B"), (),
+            "config 7 reversed: interwinding + primary-to-ground"),
+    _config(17, "Cground", ("A", "B", "C", "D"), (), (),
+            "whole DUT to ground (LO rail empty)"),
+    _config(18, "Cground_P", ("A", "B"), (), ("C", "D"),
+            "primary to ground, secondary floating shorted"),
+    _config(19, "Cground_S", ("C", "D"), (), ("A", "B"),
+            "secondary to ground, primary floating shorted"),
 ]}
 
 #: Which winding-link case in TransformerModel.WINDING_LINKS each pair of
@@ -149,6 +168,33 @@ def signal_path(config):
     lo = "".join(sorted(config["LO"]))
     link = "".join(sorted(config["LINK"]))
     return f"{hi}-{lo}" + (f"-L{link}" if link else "")
+
+
+def floating_terminals(config):
+    """Terminals on no rail. Their clamp must not drag the crossbar along."""
+    assigned = set(config["HI"]) | set(config["LO"]) | set(config["LINK"])
+    return tuple(t for t in TERMINALS if t not in assigned)
+
+
+def measurement_word(config):
+    """Relay word for a configuration in MEAS mode.
+
+    Matrix bit for every (terminal, rail) assignment, plus the isolation
+    relay of every FLOATING terminal. Without that, a terminal meant to float
+    stays tied to its column bus, whose open matrix contacts and copper load
+    the DUT node with a few pF to HI and to LO/GND. The OSL never sees that
+    capacitance -- calibration isolates every terminal -- so it lands in the
+    result: on a 1:1 transformer it put ~15 pF of phantom C33 into the
+    B-C/A-D link sweeps. Isolating floating terminals makes the measurement
+    state differ from the OPEN standard only by the DUT itself.
+    """
+    word = 0
+    for rail in RAILS:
+        for terminal in config[rail]:
+            word |= 1 << MATRIX_BITS[(terminal, rail)]
+    for terminal in floating_terminals(config):
+        word |= 1 << ISOLATE_BITS[terminal]
+    return word
 
 
 def calibration_overlay(config, mode):
@@ -248,7 +294,10 @@ class RelayBoardController:
         if config_number not in CONFIGS:
             raise ValueError(f"Unknown config {config_number}; valid: {sorted(CONFIGS)}")
         config = CONFIGS[config_number]
-        self._command(f"CONF:MEAS {config_number}")
+        # Relays are driven one by one from the table above rather than with
+        # CONF:MEAS, so the switching cannot depend on whichever relay table a
+        # given firmware build carries (1.1.1 had config 8 wrong).
+        self._apply_word(measurement_word(config))
         self.current_config = config_number
         self.current_path = signal_path(config)
         self.cal_mode = "MEAS"
@@ -271,7 +320,8 @@ class RelayBoardController:
             raise ValueError(f"Bad calibration mode {mode!r}")
         if self.current_config is None:
             raise RuntimeError("Set a measurement configuration before a calibration mode.")
-        self._command(f"CAL:MODE {mode}")
+        config = CONFIGS[self.current_config]
+        self._apply_word(measurement_word(config) | calibration_overlay(config, mode))
         self.cal_mode = mode
         return mode
 
@@ -289,6 +339,24 @@ class RelayBoardController:
         if not 0 <= relay_number < RELAY_COUNT:
             raise ValueError(f"Relay must be 0..{RELAY_COUNT - 1}, got {relay_number}")
         self._command(f"RELAY {relay_number} {1 if state else 0}")
+
+    def _apply_word(self, word):
+        """Drive the board to exactly `word`, then read it back.
+
+        Relays being released go first so a transition never closes a new
+        path while an old one is still made (no momentary HI-LO bridge).
+        """
+        current = self.get_relay_states()
+        releases = [i for i in range(RELAY_COUNT) if current[i] and not (word >> i) & 1]
+        energizes = [i for i in range(RELAY_COUNT) if not current[i] and (word >> i) & 1]
+        for index in releases:
+            self.set_relay(index, 0)
+        for index in energizes:
+            self.set_relay(index, 1)
+        readback = self.get_relay_states()
+        expected = [(word >> i) & 1 for i in range(RELAY_COUNT)]
+        if readback != expected:
+            raise RuntimeError(f"Relay board state {readback} does not match requested {expected}")
 
     def get_relay_states(self):
         response = self.visa_session.query("RELAY:ALL?").strip()
