@@ -150,8 +150,10 @@ def page_summary(pdf, state, results, differential, warnings, calibration_meta):
             ["Self-C, C11+η²C22+2ηC12", f"≥ {differential['self_capacitance_lower_bound_pf']:.1f} pF",
              "open-circuit, max over 1–10 MHz", "frequency-dependent"],
             ["C11, C22, C12 separately", "not reported", "global fit not at noise level (p. 'Limits')", "—"],
-            ["Winding → ground (P / S)", f"{estat['C_primary_ground_pf']:.2f} / {estat['C_secondary_ground_pf']:.2f} pF",
-             "configs 7, 16–19", "negligible"],
+            ["Fixture: clamp→HI / clamp→GND", f"{differential['clamp_to_HI_pf']['value']:.2f} / "
+             f"{differential['clamp_to_ground_pf']['value']:.2f} pF", "open-link differences (guarded)", "fixture"],
+            ["Fixture: LINK net → GND", f"{differential['link_net_to_ground_pf']:.1f} pF",
+             "identity 4·Y(Lcum) = Y(BC)", "fixture"],
         ]
     table(figure, [0.04, 0.30, 0.62, 0.60], ["Parameter", "Value", "How", "Confidence"], rows,
           col_widths=[0.33, 0.17, 0.33, 0.17], size=8)
@@ -208,8 +210,15 @@ def page_findings(pdf, state):
         "isolated in MEAS. Calibrations stay valid: the OSL state is unchanged.",
         "• The driver now drives every relay itself and reads the word back, so behaviour no longer depends on "
         "the flashed firmware's table (board reports 1.1.1; repo source was 1.0.0, now 1.2.0, not yet flashed).",
-        "• New electrostatic-only configs 16–19 (C33 reversed, DUT-to-ground) separate interwinding and ground "
-        "capacitance.",
+        "• New electrostatic-only configs 16–19 (C33 reversed; LO-rail coupling diagnostics).",
+        "",
+        "**Measurement physics (2026-10-11)",
+        "• The bridge senses current only in the LO rail, so the bench measures a GUARDED transfer admittance: a stray "
+        "to ground at relative potential v adds Cg·v(v−1). This explained the series-aiding state looking ~15 pF short "
+        "on every DUT (LINK net → GND ≈ 14 pF at v = ½) and showed that 'capacitance to ground' is not measurable here.",
+        "• Board paths outside the OSL (LO terminal's column, LINK loop) are asymmetric between A-B and C-D by tens of "
+        "nH. They are now measured automatically with the DUT isolated (calibrations/fixture_paths.json) and removed "
+        "from the LINK-shorted states: reciprocity 7.5 % → ~2 %, Lsc −5 %.",
     ]
     right = [
         "**Effect on the capacitance data (same DUT)",
@@ -320,18 +329,52 @@ def page_linearity_resistance(pdf, state, reference):
     plt.close(figure)
 
 
+def _subtract_path(data, path):
+    """Remove a series board path (L, R) from a Z sweep frame."""
+    if not path:
+        return data
+    data = data.copy()
+    omega = 2 * numpy.pi * data["frequency"].to_numpy()
+    z = data["magnitude"].to_numpy() * numpy.exp(1j * numpy.radians(data["phase"].to_numpy()))
+    z = z - (path[1] + 1j * omega * path[0])
+    data["magnitude"] = numpy.abs(z)
+    data["phase"] = numpy.degrees(numpy.angle(z))
+    return data
+
+
+def _board_path(paths, config_number):
+    """(L, R) the board adds to LINK-shorted configs 2 and 4 (see
+    MagneticCharacterizer.characterize_fixture_paths)."""
+    pairs = {2: ("AB", "CD"), 4: ("CD", "AB")}
+    if not paths or config_number not in pairs:
+        return None
+    driven, shorted = pairs[config_number]
+    return (paths[driven]["other_column"]["L_h"] + paths[shorted]["link_loop"]["L_h"],
+            paths[driven]["other_column"]["R_ohm"] + paths[shorted]["link_loop"]["R_ohm"])
+
+
 def page_reciprocity(pdf, state, reference):
     figure = new_page(state, "Switching self-test — reciprocity [BLA94] II-C",
                       "Z0·Zsc' = Z0'·Zsc holds for any linear two-port; a relay in the wrong state breaks it")
     axes = figure.subplots(1, 2, gridspec_kw=dict(left=0.06, right=0.98, top=0.86, bottom=0.12, wspace=0.22))
     sweeps = {n: pandas.read_csv(sweep_path(reference, n, "Zhd")) for n in (1, 2, 3, 4)
               if sweep_path(reference, n, "Zhd").exists()}
+    paths = state.get("fixture_paths")
+    worst_corrected = None
     if len(sweeps) == 4:
         _, worst, merged = tm.check_reciprocity(sweeps[1], sweeps[3], sweeps[2], sweeps[4])
-        axes[0].plot(merged.frequency, merged.relative_error * 100, color=SERIES[0])
+        axes[0].plot(merged.frequency, merged.relative_error * 100, color=SERIES[0], label="raw")
+        if paths:
+            _, _, fixed = tm.check_reciprocity(sweeps[1], sweeps[3], _subtract_path(sweeps[2], _board_path(paths, 2)),
+                                               _subtract_path(sweeps[4], _board_path(paths, 4)))
+            axes[0].plot(fixed.frequency, fixed.relative_error * 100, color=SERIES[1],
+                         label="board paths subtracted")
+            worst_corrected = float(fixed[fixed.frequency <= 10e6].relative_error.max())
+            axes[0].legend(loc="upper left")
         axes[0].axhline(5, color=SERIES[7], linewidth=1, linestyle="--")
         axes[0].text(merged.frequency.min(), 5.2, "5 % limit", color=INK2, fontsize=7.5)
-        axes[0].set_title(f"Relative error (worst {worst*100:.1f} %)")
+        axes[0].set_title(f"Relative error (raw worst {worst*100:.1f} %"
+                          + (f", corrected ≤10 MHz {worst_corrected*100:.1f} %)" if worst_corrected else ")"))
         axes[0].set_ylabel("|Z0·Zsc' − Z0'·Zsc| / |Z0·Zsc'|  (%)")
         for color, (n, label) in zip(SERIES, ((2, "Zsc (from primary)"), (4, "Zsc' (from secondary)"))):
             d = tm.average_cycles(sweeps[n])
@@ -343,10 +386,10 @@ def page_reciprocity(pdf, state, reference):
     for axis in axes:
         log_frequency_axis(axis)
     text_block(figure, 0.06, 0.06, [
-        "6–7 % and smooth below 10 MHz: the series impedance of the link path that shorts the far winding differs between "
-        "the two directions (outside the OSL plane — rev B2 TODO 'make the SHORT follow the DUT path'; the short-pair page "
-        "measures it at 26–59 nH). A relay in the wrong state would give errors of orders of magnitude. Above 10 MHz the "
-        "uncalibrated path inductance in the shorted states grows in importance and the identity degrades."], width=175)
+        "Raw, the identity is off by 6–8 %: the LINK loop that shorts the far winding and the LO terminal's column sit "
+        "outside the OSL and differ between the two directions (A-B vs C-D). Measured board-only with the DUT isolated "
+        "(fixture_paths.json) and subtracted, it closes to ~2 % — switching is correct and Lsc is corrected by the same "
+        "path. A relay in the wrong state would give errors of orders of magnitude."], width=175)
     pdf.savefig(figure)
     plt.close(figure)
 
@@ -389,11 +432,11 @@ def pages_all_sweeps(pdf, state, reference):
 
 
 def page_electrostatic(pdf, state, reference, differential):
-    figure = new_page(state, "Electrostatic-only states — interwinding and ground capacitance",
+    figure = new_page(state, "Electrostatic-only states — C33 and LO-rail coupling",
                       "Each winding shorted on itself (no magnetics): configs 7, 16–19")
     axis = figure.add_axes([0.06, 0.14, 0.55, 0.72])
-    labels = {7: "7  A+B → HI, C+D → LO", 16: "16  reversed", 17: "17  all → HI (to ground)",
-              18: "18  A+B → HI, C+D floating", 19: "19  C+D → HI, A+B floating"}
+    labels = {7: "7  A+B → HI, C+D → LO", 16: "16  reversed", 17: "17  all → HI, LO empty",
+              18: "18  A+B → HI, C+D on LINK, LO empty", 19: "19  C+D → HI, A+B on LINK, LO empty"}
     for color, number in zip(SERIES, (7, 16, 17, 18, 19)):
         f, Y = cfit.load_admittance(str(OUTPUT), reference, number)
         c = cfit.effective_capacitance(f, Y).mean(axis=0) / cfit.PICO
@@ -404,20 +447,23 @@ def page_electrostatic(pdf, state, reference, differential):
     axis.set_title("Apparent capacitance")
     axis.legend(loc="upper left")
     estat = differential["electrostatic"]
-    rows = [[str(k), f"{v[0]:.3f}", f"{estat['residual_pf'][k]:+.3f}"] for k, v in estat["measured_pf"].items()]
-    table(figure, [0.66, 0.50, 0.30, 0.36], ["Config", "C (pF), 0.1–5 MHz", "Model residual"], rows,
-          col_widths=[0.25, 0.4, 0.35])
-    text_block(figure, 0.66, 0.46, [
-        "**Solved (3 unknowns, 5 states)",
-        f"Interwinding (ground-free C33): {estat['C_interwinding_pf']:.2f} pF",
-        f"Primary to ground: {estat['C_primary_ground_pf']:.2f} pF",
-        f"Secondary to ground: {estat['C_secondary_ground_pf']:.2f} pF",
+    rows = [[str(k), f"{v[0]:.3f}"] for k, v in estat["measured_pf"].items()]
+    table(figure, [0.66, 0.56, 0.30, 0.30], ["Config", "C (pF), 0.1–5 MHz"], rows, col_widths=[0.4, 0.6])
+    text_block(figure, 0.66, 0.52, [
+        "**The bridge measures a GUARDED transfer admittance",
+        "Current is sensed only in the LO rail (RC1 shunt); strays to",
+        "board ground return unmeasured. A stray Cg at a node at relative",
+        "potential v adds Cg·v(v−1): nothing at 0 or 1 V, negative at ½.",
         "",
-        "Ground coupling is negligible, so the ground-free [BLA94] model is",
-        "appropriate for this DUT on this fixture. States 18/19 carry the",
-        "floating LINK rail (~0.4 pF), which is why they sit above 17.",
+        f"C33 = {estat['C33_pf']:.2f} pF (7 vs 16 differ by {estat['C33_asymmetry_pf']:+.3f}):",
+        "every node at 0 or 1 V, so no stray to ground enters.",
+        "",
+        "17–19 have an EMPTY LO rail: they read only the coupling into",
+        f"the LO rail ({estat['LO_rail_coupling_pf']:.2f} pF from the DUT, "
+        f"+{estat['LINK_to_LO_coupling_pf']:.2f} pF via LINK),",
+        "not capacitance to ground — that is invisible to this bridge.",
         "Above ~10 MHz C33 rises as if ~100 nH were in series: the",
-        "uncalibrated arms/columns (~40-60 nH) plus the winding path.",
+        "uncalibrated arms/columns plus the winding path.",
     ], size=8)
     pdf.savefig(figure)
     plt.close(figure)
@@ -584,10 +630,10 @@ def page_limits(pdf, state):
     right = [
         "**Next steps",
         "• Flash firmware 1.2.0 (config 8 fix, floating isolation) — the Python driver already compensates.",
-        "• Rev B2: per-terminal isolation already exists; add a clamp-side open/short residual step "
-        "(TODO 'clamp-plane residual compensation') to remove the ~1 pF isolated-clamp term and the arm inductance.",
-        "• Rev B2: make the SHORT follow the DUT path; the 26/59 nH link asymmetry measured here is the number "
-        "to design against.",
+        "• Remaining uncorrected: the clamp arms (~13 nH each, common to both directions) and the isolated-clamp "
+        "coupling (~2 pF to GND, ~0.1 pF to HI). A shorting bar / empty-clamp step would remove both.",
+        "• Rev B2: keep the LINK rail and columns away from the ground plane (~14 pF to GND today) and equalise the "
+        "A-B and C-D column/LINK path lengths (±38 nH today); make the SHORT follow the DUT path.",
         "• Populate G6K-2F-RF-S (lower open-contact capacitance) as planned.",
         "• For C11/C22/C12 on ferrite parts: measure the core's complex permeability (single-turn or toroid "
         "sample) and fit with it fixed, or accept the self-capacitance spectrum as the deliverable.",
@@ -660,7 +706,8 @@ def main():
             pass
 
     destination = pathlib.Path(arguments.out) if arguments.out else OUTPUT / f"{reference}_report.pdf"
-    state = {"page": 0, "reference": reference}
+    state = {"page": 0, "reference": reference,
+             "fixture_paths": results.get("fixture_paths")}
     dut_path = OUTPUT / f"{reference}_dut.json"
     if dut_path.exists():
         state["description"] = json.loads(dut_path.read_text()).get("description")

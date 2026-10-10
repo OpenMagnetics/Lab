@@ -40,12 +40,17 @@ these are for the B2 respin and the software that drives it.
   `CONF:MEAS`, so it works with any flashed table.
 - [x] **Firmware 1.2.0 flashed** 2026-10-11 over USB: `SYST:DFU` + dfu-util (WinUSB on 0483:DF11 via
   Zadig, once per PC). Firmware `CONF:MEAS`/`CAL:MODE` words verified equal to the Python table, 15 x 4.
-- [ ] **Lcum (config 5) does not see C33.** On both DUTs (T26 3C90 toroid, RM concentric) the series-aiding
-  state resonates at the same frequency as Z0, while [BLA94] puts C33/4 into it (B-C linked through the
-  floating LINK rail). Unexplained; it is also the state the global nodal fit misses most (35-57 %).
-  Check the LINK rail path at HF (rail inductance/capacitance) before trusting LINK-linked states for C.
-- [ ] **Clamp-plane residual step** would also remove the 7.5 % reciprocity error (link-path asymmetry),
-  seen identically on both DUTs.
+- [x] **Lcum 'missing C33' explained (2026-10-11): the bridge measures a guarded transfer admittance.**
+  Current is sensed only in the LO rail; a stray to board GND at relative potential v adds Cg*v*(v-1).
+  The LINK net (rail + two columns) has ~14 pF to GND and sits at v = 1/2 in Lcum/Ldif -> -Cg/4.
+  Same 14-15 pF on both DUTs. Configs 17-19 therefore measure LO-rail coupling, not ground capacitance.
+  B2: keep the LINK rail/columns away from the GND plane or guard them.
+- [x] **Reciprocity 7.5 % explained and corrected.** Board-only paths (DUT isolated) differ between A-B
+  and C-D: other column -39/+37 nH, LINK loop +39/+75 nH. `characterize_fixture_paths()` measures them
+  automatically (calibrations/fixture_paths.json) and subtracts them from the LINK-shorted states:
+  reciprocity -> ~2 %, Lsc -5 %. B2: equalise column/LINK path lengths.
+- [ ] Clamp arms (~13 nH each) and isolated-clamp coupling (~2 pF to GND) still need the operator
+  shorting-bar / empty-clamp step.
 - [ ] **Isolated-clamp capacitance** (~1 pF to HI and to GND per floating
   terminal) remains; it is what is left between the open-family links and
   direct C33 (+4 pF on a 1:1 part). Candidate for the clamp-plane residual step.

@@ -329,6 +329,101 @@ class MagneticCharacterizer:
 
     # ------------------------------------------------------- verification
 
+    # ------------------------------------------------------ fixture paths
+
+    #: Board-only paths, measured with every terminal isolated (the DUT stays
+    #: clamped but is out of circuit), against the calibration of the pair
+    #: they belong to. Each value is the series impedance the path adds over
+    #: that calibration's SHORT:
+    #:   other_column  HI rail -> the pair's second column -> LO
+    #:   link_loop     first column -> LINK rail -> second column -> LO
+    #: A winding shorted through LINK while the other is measured sees the far
+    #: pair's link_loop plus the driven pair's other_column (its LO terminal's
+    #: column is not the one the OSL SHORT went through). On rev B these are
+    #: tens of nH and asymmetric between A-B and C-D, which is what put the
+    #: reciprocity check 7.5 % off and inflated Lsc by ~5 %.
+    FIXTURE_PAIRS = {("A", "B"): 1, ("C", "D"): 3}
+
+    def _fixture_paths_file(self):
+        return self.calibrations_path / "fixture_paths.json"
+
+    def characterize_fixture_paths(self, allow_use_cache=True):
+        """Measure (or load) the board-only series paths. No operator step."""
+        path = self._fixture_paths_file()
+        identity = self.relay_board.identity if self.relay_board else None
+        if allow_use_cache and path.exists():
+            stored = json.loads(path.read_text())
+            if identity is None or stored.get("relay_board") == identity:
+                self.fixture_paths = stored
+                return stored
+        if self.offline:
+            self.fixture_paths = None
+            return None
+
+        print("\n-- Fixture paths (board only, DUT isolated) --")
+        isolate = sum(1 << b for b in rbc.ISOLATE_BITS.values())
+        bit = rbc.MATRIX_BITS
+        stored = {"relay_board": identity,
+                  "acquired": datetime.datetime.now().isoformat(timespec="seconds")}
+        try:
+            for (x, y), config_number in self.FIXTURE_PAIRS.items():
+                self._set_config(config_number)          # the pair's own OSL
+                states = {
+                    "short_standard": [(x, "HI"), (x, "LO"), (y, "LO")],
+                    "other_column": [(x, "HI"), (y, "HI"), (y, "LO")],
+                    "link_loop": [(x, "HI"), (x, "LINK"), (y, "LINK"), (y, "LO")],
+                }
+                readings = {}
+                for name, pairs in states.items():
+                    self.relay_board._apply_word(isolate | sum(1 << bit[q] for q in pairs))
+                    data = self.bode_100.take_Z_phase_measurement(
+                        start_frequency=1e5, stop_frequency=3e7, number_of_measurement_cycles=2,
+                        number_of_measurement_points=201, source_power_dbm=self.DRIVE_HIGH_BAND_DBM)
+                    averaged = tm.average_cycles(data)
+                    f = averaged.frequency.to_numpy()
+                    z = averaged.magnitude.to_numpy() * numpy.exp(1j * numpy.radians(averaged.phase.to_numpy()))
+                    keep = (f > 1e6) & (f < 2e7)
+                    readings[name] = (float(numpy.median((z.imag / (2 * numpy.pi * f))[keep])),
+                                      float(numpy.median(z.real[keep])))
+                base_L, base_R = readings["short_standard"]
+                stored[f"{x}{y}"] = {name: {"L_h": value[0] - base_L, "R_ohm": value[1] - base_R}
+                                     for name, value in readings.items() if name != "short_standard"}
+                print(f"  {x}{y}: other column {stored[f'{x}{y}']['other_column']['L_h']*1e9:+.1f} nH, "
+                      f"LINK loop {stored[f'{x}{y}']['link_loop']['L_h']*1e9:+.1f} nH")
+        finally:
+            self.relay_board.reset()
+        path.write_text(json.dumps(stored, indent=2))
+        self.fixture_paths = stored
+        return stored
+
+    def _path_correction(self, config_number):
+        """Series (L, R) the board adds to a LINK-shorted state, or (0, 0)."""
+        paths = getattr(self, "fixture_paths", None)
+        corrections = {2: ("AB", "CD"), 4: ("CD", "AB")}     # (driven pair, shorted pair)
+        if not paths or config_number not in corrections:
+            return 0.0, 0.0
+        driven, shorted = corrections[config_number]
+        L = paths[driven]["other_column"]["L_h"] + paths[shorted]["link_loop"]["L_h"]
+        R = paths[driven]["other_column"]["R_ohm"] + paths[shorted]["link_loop"]["R_ohm"]
+        return L, R
+
+    def _corrected(self, data, config_number):
+        """Subtract the board path from a Z or RL sweep of a LINK-shorted state."""
+        L, R = self._path_correction(config_number)
+        if L == 0.0 and R == 0.0:
+            return data
+        data = data.copy()
+        omega = 2 * numpy.pi * data["frequency"].to_numpy()
+        if "inductance" in data:
+            data["inductance"] = data["inductance"] - L
+            data["resistance"] = data["resistance"] - R
+        else:
+            z = data["magnitude"].to_numpy() * numpy.exp(1j * numpy.radians(data["phase"].to_numpy()))
+            z = z - (R + 1j * omega * L)
+            data["magnitude"] = numpy.abs(z)
+            data["phase"] = numpy.degrees(numpy.angle(z))
+        return data
+
     def verify_switching(self, allow_use_cache=False):
         """[BLA94] II-C: Z0*Zsc' = Z0'*Zsc for any linear two-port.
 
@@ -338,7 +433,8 @@ class MagneticCharacterizer:
         silently in the wrong state returning a plausible sweep; this catches it.
         """
         print("\n-- Switching self-test (reciprocity) --")
-        sweeps = {name: self.measure(number, "Z", allow_use_cache, band=self.RESONANCE_BAND)
+        sweeps = {name: self._corrected(self.measure(number, "Z", allow_use_cache, band=self.RESONANCE_BAND),
+                                        number)
                   for name, number in (("Z0", 1), ("Zsc", 2), ("Z0p", 3), ("Zscp", 4))}
         # Judged below RECIPROCITY_MAX_HZ: above ~10 MHz the uncalibrated path
         # inductance and the ferrite's dispersive capacitance dominate the shorts.
@@ -434,7 +530,11 @@ class MagneticCharacterizer:
 
         values = {}
         for name, data in sweeps.items():
-            _, values[name] = self.value_at(data, reference_frequency, "inductance")
+            number = {"Z0": 1, "Zsc": 2, "Z0p": 3, "Lcum": 5, "Ldif": 6}[name]
+            _, values[name] = self.value_at(self._corrected(data, number), reference_frequency, "inductance")
+        path_L, _ = self._path_correction(2)
+        if path_L:
+            print(f"  Lsc corrected for {path_L*1e9:.1f} nH of board path (fixture_paths.json)")
 
         summary = tm.magnetic_summary(
             L0=values["Z0"], Lsc=values["Zsc"], L0_prime=values["Z0p"],
@@ -544,8 +644,9 @@ class MagneticCharacterizer:
 
         print(f"  C33 (interwinding)       {summary['C33']['forward_pf']:.2f} pF "
               f"(reverse {summary['C33']['reverse_pf']:.2f})")
-        print(f"  to ground                primary {estat['C_primary_ground_pf']:.2f}, "
-              f"secondary {estat['C_secondary_ground_pf']:.2f} pF")
+        print(f"  fixture (guarded)        clamp->HI {summary['clamp_to_HI_pf']['value']:.2f}, "
+              f"clamp->GND {summary['clamp_to_ground_pf']['value']:.2f}, "
+              f"LINK net->GND {summary['link_net_to_ground_pf']:.1f} pF")
         print(f"  C13                      {summary['C13']['value']:.2f} +- {summary['C13']['spread']:.2f} pF")
         print(f"  C23                      {summary['C23']['value']:.2f} +- {summary['C23']['spread']:.2f} pF")
         print(f"  C13+C23  open / shorts   {summary['u_open']['value']:.2f} / {summary['u_short']['value']:.2f} pF")
@@ -712,6 +813,9 @@ class MagneticCharacterizer:
         print("=" * 70)
         print(f"Characterizing {self.reference}")
         print("=" * 70)
+        paths = self.characterize_fixture_paths()
+        if paths:
+            self.results["fixture_paths"] = paths
         self.verify_switching(allow_use_cache)
         self.verify_linearity(allow_use_cache=allow_use_cache)
         self.characterize_inductance(allow_use_cache)

@@ -82,7 +82,9 @@ PARAMETERS = (
         ("C_fH", PICO, 0.5, 2.0),       # isolated clamp to HI rail
         ("C_fG", PICO, 0.5, 2.0),       # isolated clamp to ground
         ("C_LH", PICO, 1.0, 3.0),       # LINK rail to HI rail
-        ("C_LG", PICO, 1.0, 3.0),       # LINK rail to ground
+        ("C_LG", PICO, 10.0, 10.0),     # LINK rail + its columns to ground
+        ("C_LL", PICO, 1.0, 3.0),       # LINK rail to LO rail
+        ("C_tL", PICO, 0.05, 0.2),      # each DUT terminal to the LO rail (stray)
         # Magnetics, global part. The core (open-circuit impedance) stays
         # free at every frequency; the leakage and the turns ratio do not.
         ("eta2", 1.0, None, None),       # Z22/Z11, real part (eta^2)
@@ -119,7 +121,7 @@ BOUNDS = dict(
     **{f"C_{b}": (0.0, 50.0) for b in GROUND_BRANCHES},
     L_arm_A=(0.0, 200.0), L_arm_B=(0.0, 200.0), L_arm_C=(0.0, 200.0), L_arm_D=(0.0, 200.0),
     L_link=(0.0, 300.0), R_arm=(0.0, 5.0), L_col=(0.0, 300.0), R_col=(0.0, 5.0),
-    C_fH=(0.0, 30.0), C_fG=(0.0, 30.0), C_LH=(0.0, 30.0), C_LG=(0.0, 30.0),
+    C_fH=(0.0, 30.0), C_fG=(0.0, 30.0), C_LH=(0.0, 30.0), C_LG=(0.0, 60.0), C_LL=(0.0, 30.0), C_tL=(0.0, 5.0),
     eta2=(1e-3, 1e3), eta2_i=(-1.0, 1.0),
     Lsc_hf=(0.0, 1e9), Lsc_d=(0.0, 1e9), fc_sc=(0.05, 500.0), beta_sc=(0.3, 4.0),
     Rsc_0=(0.0, 1e3), Rsc_s=(0.0, 1e3), Rsc_p=(0.0, 1e3),
@@ -166,7 +168,16 @@ _BLACHE_MATRIX = numpy.array([
 class Topology:
     """Node layout of one relay configuration.
 
-    Nodes: HI, A, B, C, D, LINK (when used). LO is the reference (ground).
+    Nodes: HI, LO, A, B, C, D, LINK; ground (board GND / BNC shells) is the
+    reference. HI and LO are NOT the same as ground for the measurement:
+    the IAD bridge senses current only in the LO rail (RC1 shunt), so a stray
+    from a DUT node to ground returns without being measured. The bench
+    therefore measures a guarded, three-terminal transfer admittance
+    I_LO / V_HI, in which a stray Cg at a node sitting at relative potential v
+    contributes Cg*v*(v-1) -- zero at v = 0 or 1, NEGATIVE at v = 1/2 (the
+    LINK node of Lcum and Ldif), +2*Cg at v = -1 or 2 (the floating far end of
+    the B-C / A-D links). Modelling it as a two-terminal admittance to ground
+    is what made Lcum look ~15 pF short on every DUT.
     """
 
     def __init__(self, config):
@@ -175,16 +186,15 @@ class Topology:
         self.uses_link = bool(config["LINK"])
         # Fixed layout for every configuration so all of them batch into one
         # solve; an unused LINK node is simply left with nothing attached.
-        self.nodes = ["HI", "A", "B", "C", "D", "LINK"]
+        self.nodes = ["HI", "LO", "A", "B", "C", "D", "LINK"]
         self.index = {n: i for i, n in enumerate(self.nodes)}
         self.floating = rbc.floating_terminals(config)
         self.first_hi = config["HI"][0] if config["HI"] else None
-        # (terminal, rail node or None for ground, is_first_hi)
+        # (terminal, rail node, is_first_hi)
         self.arms = []
         for rail in ("HI", "LO", "LINK"):
             for terminal in config[rail]:
-                node = {"HI": "HI", "LO": None, "LINK": "LINK"}[rail]
-                self.arms.append((terminal, node, rail == "HI" and terminal == self.first_hi))
+                self.arms.append((terminal, rail, rail == "HI" and terminal == self.first_hi))
 
 
 def _stamp(Y, i, j, y):
@@ -198,12 +208,14 @@ def _stamp(Y, i, j, y):
         Y[:, j, i] -= y
 
 
-NODE_COUNT = 6
+NODE_COUNT = 7
+KNOWN = (0, 1)              # HI driven at 1 V, LO held at 0 V (shunt)
+UNKNOWN = (2, 3, 4, 5, 6)   # A, B, C, D, LINK
 
 
 def _magnetic_patterns():
     """Stamp patterns of Y11, Y12, Y22 on the fixed node layout."""
-    a, b, c, d = 1, 2, 3, 4
+    a, b, c, d = 2, 3, 4, 5
     P = numpy.zeros((3, NODE_COUNT, NODE_COUNT))
     for (r, s_, v) in ((a, a, 1), (b, b, 1), (a, b, -1), (b, a, -1)):
         P[0, r, s_] += v
@@ -239,16 +251,23 @@ def static_admittance(topology, omega, p):
         z = z_arm if first else z_arm + z_col
         if rail == "LINK":
             z = z + jw * p["L_link"]
-        _stamp(Y, ix[terminal], ix[rail] if rail else None, 1.0 / z)
+        _stamp(Y, ix[terminal], ix[rail], 1.0 / z)
+
+    # Every terminal couples weakly to the LO rail. This is all that configs
+    # with an empty LO rail (17-19) can see: they do not measure capacitance
+    # to ground, which never reaches the current sensor.
+    for terminal in "ABCD":
+        _stamp(Y, ix[terminal], ix["LO"], jw * p["C_tL"])
 
     # Isolated clamps of floating terminals
     for terminal in topology.floating:
         _stamp(Y, ix[terminal], ix["HI"], jw * p["C_fH"])
         _stamp(Y, ix[terminal], None, jw * p["C_fG"])
 
-    # LINK rail
+    # LINK rail (with the columns hanging on it)
     if topology.uses_link:
         _stamp(Y, ix["LINK"], ix["HI"], jw * p["C_LH"])
+        _stamp(Y, ix["LINK"], ix["LO"], jw * p["C_LL"])
         _stamp(Y, ix["LINK"], None, jw * p["C_LG"])
 
     # A femtosiemens to ground on every node keeps a fully floating trial
@@ -258,13 +277,26 @@ def static_admittance(topology, omega, p):
     return Y
 
 
+def measured_impedance(Y):
+    """What the bridge reads: V_HI / I_LO with HI at 1 V and LO at 0 V.
+
+    Y (..., N, N) full nodal matrix (ground = reference). The unknown node
+    voltages follow from Y_uu x = -Y_u,HI; the current the shunt carries out
+    of the LO node is -(Y_LO,HI + Y_LO,u x).
+    """
+    u = list(UNKNOWN)
+    Yuu = Y[..., u, :][..., :, u]
+    rhs = -Y[..., u, 0]
+    x = numpy.linalg.solve(Yuu, rhs[..., None])[..., 0]
+    current = -(Y[..., 1, 0] + numpy.einsum("...i,...i->...", Y[..., 1, u], x))
+    return 1.0 / current
+
+
 def impedance_from_static(static, magnetic):
-    """Input impedance HI->ground. static (..., F, N, N); magnetic (F, 3)
-    with the two-port of port 1 = A-B, port 2 = C-D, dots on A and C."""
+    """Measured impedance. static (..., F, N, N); magnetic (F, 3) with the
+    two-port of port 1 = A-B, port 2 = C-D, dots on A and C."""
     Y = static + numpy.einsum("fm,mij->fij", magnetic, MAGNETIC_PATTERNS)
-    excitation = numpy.zeros(Y.shape[:-1], dtype=complex)
-    excitation[..., 0] = 1.0
-    return numpy.linalg.solve(Y, excitation[..., None])[..., 0, 0]
+    return measured_impedance(Y)
 
 
 def config_impedance(topology, omega, p, magnetic):
@@ -412,9 +444,7 @@ def _residual_matrix(dataset, omega, p, magnetic, compiled=None):
     """(F, 2*K) real residuals, relative error over sigma."""
     compiled = compiled or _Compiled(dataset, omega, p)
     Y = compiled.static + numpy.einsum("fm,mij->fij", magnetic, MAGNETIC_PATTERNS)[None]
-    excitation = numpy.zeros(Y.shape[:-1], dtype=complex)
-    excitation[..., 0] = 1.0
-    model = numpy.linalg.solve(Y, excitation[..., None])[..., 0, 0]               # (K,F)
+    model = measured_impedance(Y)                                                # (K,F)
     error = (model - compiled.measured) / compiled.measured / compiled.sigma
     return numpy.concatenate([error.real, error.imag], axis=0).T
 
@@ -702,8 +732,12 @@ def effective_capacitance(frequency, admittance):
 def electrostatic_states(output_path, reference, band=(1e5, 5e6), kind="Zhd"):
     """Configs 7, 16-19 (windings shorted on themselves, no magnetics).
 
-    Solves interwinding capacitance and each winding's capacitance to ground
-    (the Bode LO side) from five states; the over-determination is the check.
+    7 and 16 give C33 directly, and because every node sits at 0 or 1 V no
+    stray to ground enters (guarded measurement: weight v(v-1) = 0). 17-19
+    have an EMPTY LO rail, so they measure only what couples into the LO rail
+    -- they do not measure capacitance to ground, which never reaches the
+    current sensor. They are kept as fixture diagnostics (LO-rail coupling of
+    the DUT, and of the LINK rail in 18/19).
     """
     measured = {}
     for number in (7, 16, 17, 18, 19):
@@ -712,20 +746,12 @@ def electrostatic_states(output_path, reference, band=(1e5, 5e6), kind="Zhd"):
         c = effective_capacitance(f, Y)[:, keep].mean(axis=0) / PICO
         measured[number] = (float(numpy.median(c)), float(numpy.std(c)))
 
-    def model(v):
-        Ciw, gP, gS = v
-        return {7: Ciw + gP, 16: Ciw + gS, 17: gP + gS,
-                18: gP + Ciw * gS / (Ciw + gS), 19: gS + Ciw * gP / (Ciw + gP)}
-
-    solution = least_squares(lambda v: [model(v)[k] - measured[k][0] for k in measured],
-                             [15.0, 0.5, 0.5], bounds=([0, 0, 0], [500, 50, 50]))
-    fitted = model(solution.x)
     return {
         "measured_pf": measured,
-        "C_interwinding_pf": float(solution.x[0]),
-        "C_primary_ground_pf": float(solution.x[1]),
-        "C_secondary_ground_pf": float(solution.x[2]),
-        "residual_pf": {k: measured[k][0] - fitted[k] for k in measured},
+        "C33_pf": 0.5 * (measured[7][0] + measured[16][0]),
+        "C33_asymmetry_pf": measured[7][0] - measured[16][0],
+        "LO_rail_coupling_pf": measured[17][0],
+        "LINK_to_LO_coupling_pf": 0.5 * (measured[18][0] + measured[19][0]) - measured[17][0],
     }
 
 
@@ -803,7 +829,23 @@ def differential_summary(output_path, reference, kind="Zhd"):
     bands = ((5e5, 6e6), (1e6, 8e6), (1e6, 12e6), (2e6, 12e6))
     opens = [open_differences(output_path, reference, band, kind) for band in bands]
     open_values = {k: numpy.array([o[k]["value"] for o in opens]) for k in OPEN_FAMILY}
-    u_open = (open_values["AD"] - open_values["BC"]) / 4.0
+    # Guarded measurement: an isolated floating clamp at potential v adds
+    # c_H*(1-v)^2 through its coupling to HI and c_G*v*(v-1) through its
+    # coupling to ground. BD (C at 1) and AC (D at 0) differ only by c_H;
+    # BC (D at -1) gets 4c_H + 2c_G, AD (C at 2) gets c_H + 2c_G.
+    clamp_H = open_values["AC"]
+    clamp_G = ((open_values["BC"] + open_values["AD"]) / 2.0 - C33 - 2.5 * clamp_H) / 2.0
+    u_open = (open_values["AD"] - open_values["BC"] + 3.0 * clamp_H) / 4.0
+
+    # Series aiding (config 5) puts the LINK node at 1/2: 4*Y_Lcum - Y_BC
+    # is zero for the DUT itself and leaves C_LH + C_LL - C_LG of the LINK
+    # rail, minus the clamp terms BC carries.
+    f5, Y5 = load_admittance(output_path, reference, 5, kind)
+    _, Y12 = load_admittance(output_path, reference, 12, kind)
+    window = (f5 >= 1e6) & (f5 <= 8e6)
+    identity = effective_capacitance(f5, 4 * Y5.mean(axis=0) - Y12.mean(axis=0))[window] / PICO
+    link_ground = -(float(numpy.median(identity)) + 4.0 * float(numpy.mean(clamp_H))
+                    + 2.0 * float(numpy.mean(clamp_G)))
 
     C13s, C23s, dLs, rms = [], [], {"primary": [], "secondary": []}, {"primary": [], "secondary": []}
     for band in bands:
@@ -831,6 +873,9 @@ def differential_summary(output_path, reference, kind="Zhd"):
         "open_differences": {k: stat(v) for k, v in open_values.items()},
         "open_cycle_noise_pf": float(numpy.mean([opens[1][k]["cycle_spread"] for k in OPEN_FAMILY])),
         "u_open": stat(u_open),
+        "clamp_to_HI_pf": stat(clamp_H),
+        "clamp_to_ground_pf": stat(clamp_G),
+        "link_net_to_ground_pf": link_ground,
         "C13": stat(C13s),
         "C23": stat(C23s),
         "u_short": stat(C13s + C23s),
