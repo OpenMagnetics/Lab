@@ -27,7 +27,7 @@
 
 #include "scpi.h"
 
-#define VERSION "1.1.1"
+#define VERSION "1.1.2"
 #define LINE_MAX 96
 #define ERROR_QUEUE 8
 

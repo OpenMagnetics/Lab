@@ -77,21 +77,32 @@ static void delay_ms(uint32_t amount)
  * a flashed board can be updated over USB alone.  The jump is made right
  * after a reset, with the core in its reset state (HSI 8 MHz, no peripherals,
  * no interrupts) -- what the ROM expects.  The request crosses the reset in
- * .noinit RAM, which the startup code neither loads nor zeroes. */
+ * .noinit RAM, which the startup code neither loads nor zeroes.
+ *
+ * Power-up SRAM is random (and can retain old contents through a short
+ * unplug), so the request is honoured only after a pure software reset, and
+ * only if both the magic and its complement are present. */
 #define DFU_MAGIC     0xDF00B007u
 #define SYSTEM_MEMORY 0x1FFFC800u      /* F072 ROM bootloader (AN2606) */
 
-static uint32_t dfu_request __attribute__((section(".noinit")));
+static uint32_t dfu_request[2] __attribute__((section(".noinit")));
 static volatile uint8_t dfu_pending;
 
 static void relay_apply(uint32_t word);
 
 static void enter_bootloader_if_requested(void)
 {
-    if (dfu_request != DFU_MAGIC) {
+    uint32_t reset_cause = RCC_CSR;
+    RCC_CSR |= RCC_CSR_RMVF;            /* next boot sees only its own cause */
+    int requested = (reset_cause & RCC_CSR_SFTRSTF)
+                    && !(reset_cause & RCC_CSR_PORRSTF)
+                    && dfu_request[0] == DFU_MAGIC
+                    && dfu_request[1] == ~DFU_MAGIC;
+    dfu_request[0] = 0u;
+    dfu_request[1] = 0u;
+    if (!requested) {
         return;
     }
-    dfu_request = 0u;
     rcc_periph_clock_enable(RCC_SYSCFG_COMP);
     SYSCFG_CFGR1 = (SYSCFG_CFGR1 & ~(uint32_t)SYSCFG_CFGR1_MEM_MODE)
                    | SYSCFG_CFGR1_MEM_MODE_SYSTEM;
@@ -114,7 +125,8 @@ static void reboot_into_bootloader(void)
     relay_apply(0u);                    /* leave every relay released */
     *USB_BCDR_REG &= ~(uint32_t)USB_BCDR_DPPU;   /* drop the D+ pull-up: host sees */
     delay_ms(100u);                     /* an unplug before DFU appears   */
-    dfu_request = DFU_MAGIC;
+    dfu_request[0] = DFU_MAGIC;
+    dfu_request[1] = ~DFU_MAGIC;
     scb_reset_system();
 }
 
