@@ -145,10 +145,11 @@ def page_summary(pdf, state, results, differential, warnings, calibration_meta):
             ["C23 [BLA94]", f"{differential['C23']['value']:+.2f} pF",
              "leakage-cancelling short pair 14/15", f"±{differential['C23']['spread']:.1f} sys."],
             ["C13 + C23 (open / shorts)", f"{differential['u_open']['value']:+.2f} / {differential['u_short']['value']:+.2f} pF",
-             "two independent families", "2.4 pF model gap"],
+             "two independent families",
+             f"{abs(differential['u_open']['value'] - differential['u_short']['value']):.1f} pF apart"],
             ["Self-C, C11+η²C22+2ηC12", f"≥ {differential['self_capacitance_lower_bound_pf']:.1f} pF",
-             "open-circuit, max over 1–15 MHz", "frequency-dependent"],
-            ["C11, C22, C12 separately", "not identifiable", "needs a ferrite model (see p. 'Limits')", "—"],
+             "open-circuit, max over 1–10 MHz", "frequency-dependent"],
+            ["C11, C22, C12 separately", "not reported", "global fit not at noise level (p. 'Limits')", "—"],
             ["Winding → ground (P / S)", f"{estat['C_primary_ground_pf']:.2f} / {estat['C_secondary_ground_pf']:.2f} pF",
              "configs 7, 16–19", "negligible"],
         ]
@@ -522,23 +523,41 @@ def page_self_capacitance(pdf, state, reference, differential):
     axis.set_ylabel("Im(Y)/ω  (pF)")
     axis.legend(loc="lower right")
     at = differential.get("self_capacitance_at_pf", {})
+    # Describe the curve from the data rather than assume one part's shape.
+    f, Y = cfit.load_admittance(str(OUTPUT), reference, 8)
+    c = cfit.effective_capacitance(f, Y).mean(axis=0) / cfit.PICO
+    band = (f >= 2e6) & (f <= 10e6)
+    peak_f = float(f[band][numpy.argmax(c[band])])
+    falls = peak_f < 8e6 and c[band][-1] < c[band].max() - 0.5
+    if falls:
+        shape_lines = [
+            f"The curve peaks near {peak_f/1e6:.0f} MHz and then falls. A core",
+            "term alone (-L'/(w^2|L|^2) <= 0, shrinking with f) can only make it",
+            "rise towards the true value, so the self-capacitance itself",
+            "decreases with frequency: consistent with windings directly on",
+            "MnZn ferrite, whose permittivity relaxes in the MHz range.",
+        ]
+    else:
+        shape_lines = [
+            "The curve rises monotonically towards a plateau, as expected when",
+            "the core term (<= 0) fades with frequency: the self-capacitance",
+            "behaves as a near-constant here. Above ~10 MHz series path",
+            "inductance (fixture + winding) lifts it further, so the plateau",
+            "estimate is taken below 10 MHz.",
+        ]
     text_block(figure, 0.65, 0.84, [
         "**Reading",
-        f"Maximum (lower bound): {differential['self_capacitance_lower_bound_pf']:.2f} pF near 5 MHz.",
+        f"Maximum over 1–10 MHz (lower bound): {differential['self_capacitance_lower_bound_pf']:.2f} pF.",
         "Values: " + ", ".join(f"{k} {v:.1f}" for k, v in at.items()) + " pF.",
         "",
-        "Above the first resonance (1.78 MHz) the curve falls instead of",
-        "rising to a plateau. A core term alone can only make it rise; the",
-        "fall is consistent with MnZn ferrite whose permittivity relaxes in",
-        "the MHz range (turn-to-core capacitance follows it), plus the",
-        "series path inductance becoming significant above ~10 MHz.",
+    ] + shape_lines + [
         "",
         "**Consequence",
-        "C11, C22 and C12 are not frequency-independent properties of this",
-        "part, and no lumped six-capacitance set fits all 19 states (global",
-        "nodal fit: 2–7 % residual against 0.05 % noise). The defensible",
-        "numbers are C33, C13, C23 and this spectrum. For the first",
-        "resonance use the open-circuit curves directly.",
+        "C11, C22 and C12 separately are not reported: the global nodal",
+        "fit does not describe the measured states to noise level on this",
+        "bench (see 'Method limits'). The defensible numbers are C33, C13,",
+        "C23 and this spectrum; for the first resonance use the",
+        "open-circuit curves directly.",
     ], size=8)
     pdf.savefig(figure)
     plt.close(figure)
@@ -627,7 +646,7 @@ def main():
         f = differential["open_spectra"]["frequency"]
         _, Y = cfit.load_admittance(str(OUTPUT), reference, cfit.OPEN_REFERENCE)
         c = cfit.effective_capacitance(f, Y).mean(axis=0) / cfit.PICO
-        window = (f >= 1e6) & (f <= 15e6)
+        window = (f >= 1e6) & (f <= 10e6)
         differential["self_capacitance_lower_bound_pf"] = float(c[window].max())
         differential["self_capacitance_at_pf"] = {
             f"{x/1e6:g} MHz": float(c[numpy.argmin(numpy.abs(f - x))]) for x in (3e6, 5e6, 10e6, 20e6, 30e6)}

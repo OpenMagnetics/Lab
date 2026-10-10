@@ -537,7 +537,7 @@ class MagneticCharacterizer:
         f = spectra["frequency"]
         _, Y_open = cfit.load_admittance(str(self.output_path), self.reference, cfit.OPEN_REFERENCE)
         c_open = cfit.effective_capacitance(f, Y_open).mean(axis=0) / cfit.PICO
-        window = (f >= 1e6) & (f <= 15e6)
+        window = (f >= 1e6) & (f <= 10e6)
         summary["self_capacitance_lower_bound_pf"] = float(c_open[window].max())
         summary["self_capacitance_at_pf"] = {
             f"{x/1e6:g} MHz": float(c_open[numpy.argmin(numpy.abs(f - x))]) for x in (3e6, 5e6, 10e6, 20e6, 30e6)}

@@ -43,7 +43,7 @@ def synthetic_magnetic(frequency, L1=260e-6, eta=1.0008, k=0.9985):
 TRUTH = {
     "C_AB": 6.0, "C_CD": 7.5, "C_AC": 9.0, "C_AD": 0.8, "C_BC": 1.2, "C_BD": 7.6,
     "C_AG": 0.15, "C_BG": 0.05, "C_CG": 0.2, "C_DG": 0.1,
-    "L_arm": 11.0, "R_arm": 0.06, "L_col": 28.0, "R_col": 0.04,
+    "L_arm_A": 11.0, "L_arm_B": 14.0, "L_arm_C": 9.0, "L_arm_D": 16.0, "L_link": 25.0, "R_arm": 0.06, "L_col": 28.0, "R_col": 0.04,
     "C_fH": 1.0, "C_fG": 0.9, "C_LH": 0.6, "C_LG": 0.5,
 }
 

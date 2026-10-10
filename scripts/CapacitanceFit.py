@@ -67,7 +67,15 @@ PARAMETERS = (
     [(f"C_{b}", PICO, None, None) for b in DUT_BRANCHES]
     + [(f"C_{b}", PICO, 0.3, 1.0) for b in GROUND_BRANCHES]
     + [
-        ("L_arm", NANO, 13.0, 15.0),     # clamp arm + iso contact, per terminal
+        # Clamp arm + iso contact, one per terminal: the four arms and the
+        # paths that short a far winding are not symmetric on the board (the
+        # two short-circuit directions differ by tens of nH), and one shared
+        # value forces the fit to bend the turns ratio instead.
+        ("L_arm_A", NANO, 13.0, 15.0),
+        ("L_arm_B", NANO, 13.0, 15.0),
+        ("L_arm_C", NANO, 13.0, 15.0),
+        ("L_arm_D", NANO, 13.0, 15.0),
+        ("L_link", NANO, 20.0, 30.0),    # extra series of the LINK rail per terminal
         ("R_arm", 1.0, 0.05, 0.1),
         ("L_col", NANO, 35.0, 30.0),     # column bus + crossbar contact
         ("R_col", 1.0, 0.03, 0.1),
@@ -109,7 +117,8 @@ NAMES = [p[0] for p in PARAMETERS]
 BOUNDS = dict(
     {f"C_{b}": (-100.0, 500.0) for b in DUT_BRANCHES},
     **{f"C_{b}": (0.0, 50.0) for b in GROUND_BRANCHES},
-    L_arm=(0.0, 200.0), R_arm=(0.0, 5.0), L_col=(0.0, 300.0), R_col=(0.0, 5.0),
+    L_arm_A=(0.0, 200.0), L_arm_B=(0.0, 200.0), L_arm_C=(0.0, 200.0), L_arm_D=(0.0, 200.0),
+    L_link=(0.0, 300.0), R_arm=(0.0, 5.0), L_col=(0.0, 300.0), R_col=(0.0, 5.0),
     C_fH=(0.0, 30.0), C_fG=(0.0, 30.0), C_LH=(0.0, 30.0), C_LG=(0.0, 30.0),
     eta2=(1e-3, 1e3), eta2_i=(-1.0, 1.0),
     Lsc_hf=(0.0, 1e9), Lsc_d=(0.0, 1e9), fc_sc=(0.05, 500.0), beta_sc=(0.3, 4.0),
@@ -224,10 +233,12 @@ def static_admittance(topology, omega, p):
         _stamp(Y, ix[terminal], None, jw * p[f"C_{terminal}G"])
 
     # Fixture: series arm (+column) from each assigned terminal to its rail
-    z_arm = p["R_arm"] + jw * p["L_arm"]
     z_col = p["R_col"] + jw * p["L_col"]
     for terminal, rail, first in topology.arms:
+        z_arm = p["R_arm"] + jw * p[f"L_arm_{terminal}"]
         z = z_arm if first else z_arm + z_col
+        if rail == "LINK":
+            z = z + jw * p["L_link"]
         _stamp(Y, ix[terminal], ix[rail] if rail else None, 1.0 / z)
 
     # Isolated clamps of floating terminals

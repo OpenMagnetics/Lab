@@ -38,7 +38,14 @@ these are for the B2 respin and the software that drives it.
   OSL state unchanged, so stored calibrations stay valid.
 - [x] Driver drives relays individually (`RELAY n,s` + readback) instead of
   `CONF:MEAS`, so it works with any flashed table.
-- [ ] **Flash firmware 1.2.0** (board reports 1.1.1). Needs arm-none-eabi.
+- [x] **Firmware 1.2.0 flashed** 2026-10-11 over USB: `SYST:DFU` + dfu-util (WinUSB on 0483:DF11 via
+  Zadig, once per PC). Firmware `CONF:MEAS`/`CAL:MODE` words verified equal to the Python table, 15 x 4.
+- [ ] **Lcum (config 5) does not see C33.** On both DUTs (T26 3C90 toroid, RM concentric) the series-aiding
+  state resonates at the same frequency as Z0, while [BLA94] puts C33/4 into it (B-C linked through the
+  floating LINK rail). Unexplained; it is also the state the global nodal fit misses most (35-57 %).
+  Check the LINK rail path at HF (rail inductance/capacitance) before trusting LINK-linked states for C.
+- [ ] **Clamp-plane residual step** would also remove the 7.5 % reciprocity error (link-path asymmetry),
+  seen identically on both DUTs.
 - [ ] **Isolated-clamp capacitance** (~1 pF to HI and to GND per floating
   terminal) remains; it is what is left between the open-family links and
   direct C33 (+4 pF on a 1:1 part). Candidate for the clamp-plane residual step.
