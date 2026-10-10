@@ -18,3 +18,4 @@ scripts/output/
 
 # Local Claude Code settings
 .claude/
+firmware/build/

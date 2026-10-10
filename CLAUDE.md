@@ -10,27 +10,33 @@ An automated magnetics characterization lab. Three coupled parts:
 - `hardware/relay-board-revB/` — the current KiCad 9 board: 18-relay switching matrix, STM32F072 USB/SCPI controller, and an **integrated B-WIC measurement bridge** (three BNCs straight to the Bode 100 — no external adapter). Generated programmatically by Python, routed by freerouting with locked pre-routes.
 - `firmware/` — STM32F072 firmware (libopencm3, USB CDC-ACM, SCPI parser). Crystal-less USB via HSI48 + CRS.
 
-`hardware/B-WIC-Adapter/` is the abandoned rev A (kept for reference; its DRC never closed and the relay COM/NC pins were swapped).
+`hardware/relay-board-revB2/` is a work-in-progress respin of revB (USB-C moved to the right edge, D+/D- swapped on the USBLC6, relaxed driver band, extra `cleanup_dangling.py` post-route sweep). `hardware/B-WIC-Adapter/` is the abandoned rev A (kept for reference; its DRC never closed, the relay COM/NC pins were swapped, and its scripts hardcode another user's paths).
 
 ## Commands
 
 ```bash
-pip install -r scripts/requirements.txt
+pip install -r scripts/requirements.txt   # generate_schematic.py also needs kicad-sch-api (not listed)
 
-# Math/model tests (no instruments needed)
+# Math/model tests (no instruments needed). Plain script, NOT pytest: check() doesn't
+# assert, so pytest would report false passes. Exits 1 on failure.
 python scripts/test_model.py
 
-# Calibration flow against fake instruments (relay check, MEAS restore, sidecar reuse)
+# Calibration flow against fake instruments (relay check, MEAS restore, sidecar reuse, cold start)
 python scripts/test_calibration.py
 
-# Synthetic end-to-end pipeline check: builds a known DUT, runs the recipes
+# Global capacitance fit recovers a known synthetic DUT (~1 min)
+python scripts/test_capacitance_fit.py
+
+# Synthetic end-to-end pipeline check: builds a known DUT (reference SYNTHETIC), writes its CSVs
 python scripts/make_synthetic_dut.py
+python scripts/MagneticCharacterizer.py SYNTHETIC --cache
 
 # Relay board self-test: connects, sweeps configs, prints relay states
 python scripts/RelayBoardController.py
 
-# Main entry point — see "Running a characterization" below
-python scripts/MagneticCharacterizer.py
+# Main entry point (argparse): reference [--cache] [--port ASRLn::INSTR] [--bode-ip IP]
+#   [--ac-resistance [--gaps ...]] [--no-auto-calibrate]
+python scripts/MagneticCharacterizer.py <reference>
 ```
 
 Hardware scripts that `import pcbnew` **must** run under KiCad's bundled interpreter, not the system Python:
@@ -49,24 +55,31 @@ python hardware/relay-board-revB/verify_board.py
 # Post-route audits and outputs
 "C:\Program Files\KiCad\9.0\bin\python.exe" hardware/relay-board-revB/parasitic_report.py
 python hardware/relay-board-revB/generate_bom.py
-python hardware/relay-board-revB/export_fab.py     # DRC-gated Gerber/drill/pos bundle
-python hardware/relay-board-revB/simulate_calibration.py   # needs ngspice on PATH
+python hardware/relay-board-revB/export_fab.py      # DRC-gated Gerber/drill/pos bundle (hardcoded kicad-cli path)
+python hardware/relay-board-revB/export_jlcpcb.py   # JLC BOM/CPL xlsx; needs export_fab.py's fab/relay_board_pos.csv
+python hardware/relay-board-revB/simulate_calibration.py   # needs ngspice; geometry comes from generate_pcb.py constants
 
-# Firmware (arm-none-eabi + libopencm3)
+# Firmware (arm-none-eabi + libopencm3 at $OPENCM3_DIR, default ../libopencm3,
+# built with: make -C libopencm3 TARGETS=stm32/f0)
 make -C firmware
+make -C firmware update  # normal path: SYST:DFU over USB + STM32CubeProgrammer (scripts/update_firmware.py)
+make -C firmware flash   # st-flash over SWD (J8)
+make -C firmware dfu     # dfu-util; hold BOOT0 while plugging USB
+# Blank boards: STM32F072 has no empty-flash DFU fallback; first flash needs BOOT0 high at
+# power-up (revB: bridge left pads of R4 and R3). Windows needs WinUSB on 0483:DF11 once (Zadig).
 ```
 
 ## Architecture
 
 Three layers, bottom-up:
 
-1. **`Bode100Analyzer.MagneticMeasurer`** — SCPI over TCP to the Bode 100 (`TCPIP::<ip>::5025::SOCKET`, IP hardcoded in `__init__`). Owns OSL calibration and the measurement primitives (IAD impedance method, long-form pandas DataFrames indexed by `measurement_index` + `frequency`): `take_Rs_Ls_measurement`, `take_Z_phase_measurement`, `take_Cs_measurement`. `calibrate()` requires an explicit calibration group and drives the board's `CAL:MODE OPEN|SHORT|LOAD` relay overlays.
-2. **`RelayBoardController`** — SCPI over serial (115200) to the STM32, auto-detected by scanning `ASRL*` resources for an `*IDN?` starting with `OpenMagnetics,RelayBoard`. `MATRIX_BITS`/`LOAD_HI_BIT`/`ISOLATE_BITS` mirror `firmware/include/relay_map.h` — **the two tables must stay in sync** (verify_board.py cross-checks them). Exposes 15 configs (`CONF:MEAS n`), `signal_path()` naming, and `calibration_overlay()`.
-3. **`MagneticCharacterizer`** — orchestration. Each `characterize_*` method is a recipe: switch config → (re)calibrate if the signal path changed → measure → derive a parameter via `TransformerModel` → plot.
+1. **`Bode100Analyzer.MagneticMeasurer`** — SCPI over TCP to the Bode 100 (`TCPIP::<ip>::5025::SOCKET`; IP is a default argument, override with `--bode-ip`). Measurement primitives (IAD impedance method, long-form pandas DataFrames indexed by `measurement_index` + `frequency`): `take_Rs_Ls_measurement`, `take_Z_phase_measurement`, `take_Cs_measurement`. `calibrate()` requires an explicit calibration group; it loads an existing `.mcalx`, otherwise falls back to an interactive manual OSL. It never touches the relay board.
+2. **`RelayBoardController`** — SCPI over serial (115200) to the STM32, auto-detected by scanning `ASRL*` resources for an `*IDN?` starting with `OpenMagnetics,RelayBoard`. Exposes 15 configs (`CONF:MEAS n`), `signal_path()` naming, `calibration_overlay()`, and `set_calibration_mode()` (`CAL:MODE OPEN|SHORT|LOAD|MEAS`). `MATRIX_BITS`/`LOAD_HI_BIT`/`ISOLATE_BITS` mirror `firmware/include/relay_map.h` — **keeping the two in sync is manual**: `verify_board.py` checks `MATRIX_BITS` against the netlist but nothing reads `relay_map.h` (despite comments claiming otherwise).
+3. **`MagneticCharacterizer`** — orchestration. Recipes (`measure`, `verify_switching`, `verify_linearity`, `characterize_inductance/resistances/capacitance/ac_resistance`, `characterize_all`): switch config → (re)calibrate if the signal path changed → measure → derive a parameter via `TransformerModel` → plot.
 
 ### Calibration is per signal path, at the isolation-relay contact plane
 
-The OSL plane sits at the isolation relay contacts: OPEN = all four iso relays energized, SHORT = additionally close the first HI terminal's LO relay, LOAD = a fifth DUT-less matrix column with an on-board 100 Ω 0.1 % standard (R5, K13/K14). Calibration files are per-path `.mcalx` under `scripts/calibrations/` with a `.json` provenance sidecar (re-acquired after 24 h or when board, analyzer or drive level change), acquired automatically with the DUT clamped after a raw relay check of the three standards — there is no manual open/short/load fixture step and no `CALIBRATION_GROUPS` table anymore. Never call `relay_board.set_config()` directly from characterization code — use `MagneticCharacterizer._set_config()`, which handles recalibration on path changes.
+The OSL plane sits at the isolation relay contacts: OPEN = all four iso relays energized, SHORT = additionally close the first HI terminal's LO relay, LOAD = a fifth DUT-less matrix column with an on-board 100 Ω 0.1 % standard (R5, K13/K14). The automatic sequence lives in `MagneticCharacterizer._ensure_calibrated` (drives `set_calibration_mode`, skipped with `--no-auto-calibrate`) and writes per-path `relay_board_{signal_path}.mcalx` under `scripts/calibrations/` (`isi_board.mcalx`/`small_board.mcalx` there are rev A leftovers). Never call `relay_board.set_config()` directly from characterization code — use `MagneticCharacterizer._set_config()`, which handles recalibration on path changes. Each `.mcalx` has a `.json` provenance sidecar (re-acquired after 24 h or when board, analyzer or drive level change); on the first path of a session the raw relay check runs through the fresh OSL because IAD will not sweep uncorrected.
 
 ### Relay driving and the SCPI server (bench notes)
 
@@ -77,25 +90,21 @@ The OSL plane sits at the isolation relay contacts: OPEN = all four iso relays e
 
 `characterize_capacitance` takes dense `Zhd` sweeps (10 kHz-50 MHz, 801 pts x 4 cycles) and runs `CapacitanceFit.differential_summary`: C33 direct (7, 16), ground (17-19), core-free open-link differences, and leakage-cancelling short pairs for C13/C23. The [BLA94] resonance solve is kept as `characterize_capacitance_resonance`. `CapacitanceFit.fit` is a global nodal fit (variable projection, core free per frequency) validated by `test_capacitance_fit.py`; on ferrite parts whose self-capacitance is dispersive it does not fit, and its C11/C12/C22 must not be reported. `make_report.py <reference>` builds the PDF report from cache.
 
-### Running a characterization
+### Cache and offline mode
 
-`MagneticCharacterizer.py`'s `__main__` block is the UI: a stack of commented-out constructor calls (one per DUT reference) and method calls. Edit which lines are uncommented rather than adding an argument parser, unless asked to.
-
-Every `characterize_*` method takes `allow_use_cache`. Raw sweeps are written to `scripts/output/{reference}_{recipe}_{quantity}.csv`; with `allow_use_cache=True` an existing CSV is read back instead of re-measuring. This is how analysis/plotting/curve-fitting changes get iterated on with no instruments connected — always pass `True` when working on the math rather than the measurement. `make_synthetic_dut.py` writes a full synthetic CSV set (reference `SYNTHETIC`) with known ground truth for pipeline validation.
-
-Recipes come in `_basic` / `_medium` / `_advanced` tiers: basic reads a value straight off the sweep, medium applies closed-form relations, advanced fits a lumped model with `scipy.optimize` over several configs.
+Raw sweeps go to `scripts/output/{reference}_cfg{NN}_{configname}_{RL|Z|Cs}.csv` (plus `{reference}_acr_{label}_RL.csv`, `{reference}_ac_resistance.csv`, `{reference}_results.json`); `allow_use_cache=True` / `--cache` reads an existing CSV instead of re-measuring. Always use the cache when working on math/plotting rather than measurement. If either instrument fails to connect, the constructor silently sets `self.offline = True` and only cached data works.
 
 ### Hardware generation flow (rev B)
 
-`generate_schematic.py` (kicad-sch-api) → `relay_board.kicad_sch` + ERC. `generate_pcb.py` (pcbnew) is the single source of truth for the layout: board outline with USB tab, face-to-face DUT clamp bay top-center, 4×3 relay crossbar + load column + per-terminal iso relays, the B-WIC bridge band with three BNCs along the bottom edge, and **every measurement-critical net as locked pre-routed copper** (arms, buses, rails, bridge, coil returns, USB differential pair, strap grounds). 4-layer stackup: F.Cu signals, In1.Cu +5 V, In2.Cu GND, B.Cu coil returns/AGND island/USB. `verify_board.py` checks the exported `relay_board.xml` netlist against a per-relay pin→net truth table and simulates every config — update it alongside any schematic change.
+`generate_schematic.py` → `relay_board.kicad_sch` + ERC. `generate_pcb.py` (pcbnew) is the source of truth for the layout, including **every measurement-critical net as locked pre-routed copper**. 4-layer stackup: F.Cu signals, In1.Cu +5 V, In2.Cu GND, B.Cu coil returns/AGND island/USB. `verify_board.py` checks the exported `relay_board.xml` netlist against a per-relay pin→net truth table and simulates every config — update it alongside any schematic change. `DESIGN_NOTES.md` records the parasitic/calibration reasoning.
 
-`route_pcb.py` automates the freerouting `.dsn`/`.ses` round trip (vendored jar + JRE in `tools/`) for the non-critical nets only, then repairs freerouting's known clearance blindness near locked copper, sweeps dangling fragments, drops fanout vias for plane nets, fills zones, and runs DRC. It loops extra freerouting rounds until nothing is unconnected. Do not hand-route in the GUI; change `generate_pcb.py` and re-run the two scripts.
+`route_pcb.py` automates the freerouting `.dsn`/`.ses` round trip for the non-critical nets only, then repairs freerouting's clearance blindness near locked copper, sweeps dangling fragments, drops fanout vias for plane nets, fills zones, runs DRC, and loops until nothing is unconnected. Do not hand-route in the GUI; change `generate_pcb.py` and re-run.
 
-`relay_board_BOM.md`, `relay_board_netlist.md`, `parasitic` output, and the `*_erc.txt` / `*_drc.txt` reports are generated — regenerate, don't hand-edit. `DESIGN_NOTES.md` records the parasitic/calibration reasoning behind the layout.
+Exception: revB's `fix_usb_orientation.py`, `fix_usb_cleanup.py`, `fix_usblc6_led.py` are one-shot patches applied directly to the fab `relay_board.kicad_pcb` (run with cwd = the board dir; they write `relay_board_backup_*`). The fab master therefore differs from a fresh `generate_pcb.py` run — don't regenerate revB over it.
 
-Firmware ↔ driver ↔ netlist consistency is enforced three ways: `relay_map.h` and `RelayBoardController.MATRIX_BITS` carry the same bit table, and `verify_board.py` walks both against the netlist.
+`relay_board_BOM.*`, `relay_board_JLC_*.xlsx`, `fab/`, `relay_board_fab.zip`, parasitic output, and `*_erc.txt` / `*_drc.txt` are generated — regenerate, don't hand-edit.
 
-`tools/` is vendored third-party tooling (freerouting + JRE, kicad-happy review skills) — not project source.
+`tools/` (freerouting 1.9.0 jar + JRE, kicad-happy skills) is gitignored and not in the repo — obtain it separately; `route_pcb.py` falls back to `java` on PATH.
 
 ### Known KiCad 9 pitfalls (hard-won)
 

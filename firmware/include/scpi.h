@@ -28,5 +28,6 @@ cal_mode_t scpi_query_cal_mode(void);
 int scpi_action_set_relay(uint32_t index, uint32_t state);
 uint32_t scpi_query_relay_word(void);
 int scpi_action_self_test(void);
+int scpi_action_enter_dfu(void);
 
 #endif

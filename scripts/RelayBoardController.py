@@ -366,6 +366,19 @@ class RelayBoardController:
         """Firmware-side check: shift register readback and coil supply rail."""
         return self.visa_session.query("*TST?").strip()
 
+    def enter_dfu(self):
+        """Reboot the board into the STM32 ROM DFU bootloader (firmware >= 1.1.0).
+
+        All relays are released and the serial port disappears; the board
+        re-enumerates as "STM32 BOOTLOADER" (0483:DF11), ready for
+        STM32_Programmer_CLI -c port=usb1 or dfu-util. No reply is sent.
+        """
+        self.visa_session.write("SYST:DFU")
+        try:
+            self.visa_session.close()
+        except Exception:
+            pass
+
     def reset(self):
         self._command("*RST")
         self.current_config = None

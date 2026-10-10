@@ -16,6 +16,8 @@
  *   RELAY <0..17>,<0|1>   manual override of one relay (leaves config = 0)
  *   RELAY:ALL?            -> 18 comma-separated coil states, K1 first
  *   SYST:ERR?             -> oldest queued error, "0,\"No error\"" when empty
+ *   SYST:DFU              release all relays, detach USB and reboot into the
+ *                         ROM DFU bootloader (no reply; firmware update)
  *
  * Matches the driver in scripts/RelayBoardController.py.
  */
@@ -178,6 +180,8 @@ static void execute(const char *command)
             }
         }
         push_error(SCPI_ERR_DATA_OUT_OF_RANGE);
+    } else if (starts(command, "SYST:DFU")) {
+        push_error(scpi_action_enter_dfu());
     } else if (starts(command, "SYST:ERR?")) {
         if (error_count == 0) {
             reply("0,\"No error\"");
