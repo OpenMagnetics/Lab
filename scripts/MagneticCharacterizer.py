@@ -647,6 +647,10 @@ class MagneticCharacterizer:
         print(f"  fixture (guarded)        clamp->HI {summary['clamp_to_HI_pf']['value']:.2f}, "
               f"clamp->GND {summary['clamp_to_ground_pf']['value']:.2f}, "
               f"LINK net->GND {summary['link_net_to_ground_pf']:.1f} pF")
+        print(f"  C11 / C22 (shorted)      {summary['C11']['value']:.2f} +- {summary['C11']['spread']:.2f} / "
+              f"{summary['C22']['value']:.2f} +- {summary['C22']['spread']:.2f} pF")
+        print(f"  C12 (from S={summary['S_open_pf']:.2f})    {summary['C12']['value']:.2f} +- {summary['C12']['spread']:.2f} pF")
+        print("  branch capacitors        " + "  ".join(f"{k} {v:.2f}" for k, v in summary["branches_pf"].items()))
         print(f"  C13                      {summary['C13']['value']:.2f} +- {summary['C13']['spread']:.2f} pF")
         print(f"  C23                      {summary['C23']['value']:.2f} +- {summary['C23']['spread']:.2f} pF")
         print(f"  C13+C23  open / shorts   {summary['u_open']['value']:.2f} / {summary['u_short']['value']:.2f} pF")
@@ -850,6 +854,9 @@ class MagneticCharacterizer:
             print(f"  Interwinding C33         {differential['C33']['forward_pf']:.2f} pF")
             print(f"  C13 / C23                {differential['C13']['value']:.2f} / "
                   f"{differential['C23']['value']:.2f} pF")
+            if "C11" in differential:
+                print(f"  C11 / C22 / C12          {differential['C11']['value']:.2f} / "
+                      f"{differential['C22']['value']:.2f} / {differential['C12']['value']:.2f} pF (+-2-3 sys.)")
             print(f"  Self-C across windings   >= {differential['self_capacitance_lower_bound_pf']:.2f} pF")
         if capacitance:
             print(f"  Interwinding C33         {capacitance['C33']*1e12:.2f} pF")

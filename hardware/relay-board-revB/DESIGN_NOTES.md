@@ -35,7 +35,10 @@ and varying with relay state within a calibration group. Rev B:
 | Rails + descents + tabs | ~5 pF, ~90 nH | Yes (constant) |
 | Column bus + open contacts of a **floating** terminal | measured ~8 pF total (to HI and LO/GND) | **No** -- the OSL isolates every terminal, so a floating terminal's column is never in it. Fixed in the driver/firmware 1.2: floating terminals are isolated in MEAS |
 | Isolated clamp of a floating terminal (arm + open iso contact) | measured ~1 pF to HI and ~0.7-1 pF to GND | **No** -- the remaining open-family excess (~4 pF on BC/AD links) |
-| Far-winding short path in shorted states (rail + columns) | measured 26 nH (primary pair 9/11) and 59 nH (secondary pair 14/15) differences | **No** -- reciprocity off by 6-8 %; see TODO_revB2 'SHORT follows the DUT path' |
+| Far-winding short path in shorted states (rail + columns) | measured 26 nH (primary pair 9/11) and 59 nH (secondary pair 14/15) differences | **No** -- reciprocity off by 6-8 %; now measured and subtracted automatically (fixture_paths.json) |
+| Column path HI->t->LO relative to A (board-only, 2026-10-11) | B -39.3, C -32.7, D +4.1 nH (repeatable to 0.04 nH) | **No** for the LO terminal of a path; column D is the long one |
+| LINK loop A col -> LINK -> t col -> LO | B +39.3, C +53.5, D +94.2 nH; 111-198 mohm | **No** -- carried by every LINK-linked state |
+| LINK net (rail + linked columns) to board GND | ~14.5 pF (both DUTs) | **No** -- enters as Cg*v*(v-1): the bridge senses current only in LO |
 
 Uncalibrated total per side (terminals on a rail): **≈0.4 pF + 13 nH + 100 mΩ** — three orders of
 magnitude below rev A's fixture capacitance, and small against every quantity

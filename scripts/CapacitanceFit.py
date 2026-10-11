@@ -110,6 +110,17 @@ PARAMETERS = (
 #: core is left completely free. C11 then comes from the primary-driven
 #: shorts, C22 from the secondary-driven shorts and C11+C22-2*C12 from the
 #: series-opposing (Ldif) state, none of which involves the core.
+#: Every configuration routes HI and LO through its own columns and rail
+#: segments, outside its OSL: measured board-only, these differ between
+#: configurations by tens of nH (fixture_paths.json). A shared arm/column
+#: model cannot express that, so each configuration gets its own series path
+#: with a prior of that size.
+SERIES_CONFIGS = tuple(range(1, 20))
+PARAMETERS = PARAMETERS + [
+    item
+    for number in SERIES_CONFIGS
+    for item in ((f"Ls_cfg{number:02d}", NANO, 0.0, 60.0), (f"Rs_cfg{number:02d}", 1.0, 0.0, 0.2))
+]
 NAMES = [p[0] for p in PARAMETERS]
 
 #: Physical bounds (display units). Inter-terminal branch capacitors may be
@@ -120,7 +131,9 @@ BOUNDS = dict(
     {f"C_{b}": (-100.0, 500.0) for b in DUT_BRANCHES},
     **{f"C_{b}": (0.0, 50.0) for b in GROUND_BRANCHES},
     L_arm_A=(0.0, 200.0), L_arm_B=(0.0, 200.0), L_arm_C=(0.0, 200.0), L_arm_D=(0.0, 200.0),
-    L_link=(0.0, 300.0), R_arm=(0.0, 5.0), L_col=(0.0, 300.0), R_col=(0.0, 5.0),
+    L_link=(0.0, 300.0), R_arm=(0.0, 5.0),
+    **{f"Ls_cfg{n:02d}": (-300.0, 300.0) for n in range(1, 20)},
+    **{f"Rs_cfg{n:02d}": (-2.0, 2.0) for n in range(1, 20)}, L_col=(0.0, 300.0), R_col=(0.0, 5.0),
     C_fH=(0.0, 30.0), C_fG=(0.0, 30.0), C_LH=(0.0, 30.0), C_LG=(0.0, 60.0), C_LL=(0.0, 30.0), C_tL=(0.0, 5.0),
     eta2=(1e-3, 1e3), eta2_i=(-1.0, 1.0),
     Lsc_hf=(0.0, 1e9), Lsc_d=(0.0, 1e9), fc_sc=(0.05, 500.0), beta_sc=(0.3, 4.0),
@@ -299,9 +312,18 @@ def impedance_from_static(static, magnetic):
     return measured_impedance(Y)
 
 
+def series_path(number, omega, p):
+    """Per-configuration series path outside the OSL (zero if not modelled)."""
+    key = f"Ls_cfg{number:02d}"
+    if key not in p:
+        return numpy.zeros_like(omega, dtype=complex)
+    return p[f"Rs_cfg{number:02d}"] + 1j * omega * p[key]
+
+
 def config_impedance(topology, omega, p, magnetic):
-    """Input impedance HI->ground of one configuration, vectorised over f."""
-    return impedance_from_static(static_admittance(topology, omega, p), magnetic)
+    """Measured impedance of one configuration, vectorised over f."""
+    return (impedance_from_static(static_admittance(topology, omega, p), magnetic)
+            + series_path(topology.config["number"], omega, p))
 
 
 # --------------------------------------------------------------------------
@@ -430,6 +452,7 @@ class _Compiled:
         self.static = numpy.stack([static_admittance(dataset.topologies[n], omega, p)
                                    for n in dataset.configs])                  # (K,F,N,N)
         self.measured = numpy.stack([dataset.impedance[n] for n in dataset.configs])  # (K,F)
+        self.series = numpy.stack([series_path(n, omega, p) for n in dataset.configs])
         self.sigma = numpy.stack([dataset.sigma[n] for n in dataset.configs])
 
     def subset(self, index):
@@ -437,6 +460,7 @@ class _Compiled:
         other.static = self.static[:, index]
         other.measured = self.measured[:, index]
         other.sigma = self.sigma[:, index]
+        other.series = self.series[:, index]
         return other
 
 
@@ -444,7 +468,7 @@ def _residual_matrix(dataset, omega, p, magnetic, compiled=None):
     """(F, 2*K) real residuals, relative error over sigma."""
     compiled = compiled or _Compiled(dataset, omega, p)
     Y = compiled.static + numpy.einsum("fm,mij->fij", magnetic, MAGNETIC_PATTERNS)[None]
-    model = measured_impedance(Y)                                                # (K,F)
+    model = measured_impedance(Y) + compiled.series                             # (K,F)
     error = (model - compiled.measured) / compiled.measured / compiled.sigma
     return numpy.concatenate([error.real, error.imag], axis=0).T
 
@@ -880,6 +904,89 @@ def differential_summary(output_path, reference, kind="Zhd"):
         "C23": stat(C23s),
         "u_short": stat(C13s + C23s),
         "fixture_dL_nh": {k: stat(v) for k, v in dLs.items()},
+        **_self_capacitances(output_path, reference, kind, C33, numpy.mean(C13s), numpy.mean(C23s)),
         "short_pair_rms": {k: stat(v) for k, v in rms.items()},
         "open_spectra": opens[1],
+    }
+
+
+# --------------------------------------------------------------------------
+# Self-capacitances from the shorted states
+# --------------------------------------------------------------------------
+#
+# With one winding shorted, the other sees its leakage inductance in parallel
+# with the [BLA94] C1_C3 sum: C11 for the B-D (or B-C) link measured from the
+# primary (config 9), C22 for the same link from the secondary (config 14).
+# A wrong C bends the de-embedded leakage up or down like w^2 above ~20 MHz;
+# the proximity effect only lowers it smoothly; a series path outside the
+# OSL shifts it -- but also scales the apparent C by about (1 - 2 Ls/L),
+# 15-30 % on this board. So C comes out of a smooth-leakage fit over the top
+# of the band, and its systematic spread is taken over bands and over the
+# series-path placement (none, or the measured path magnitude at the port).
+
+def shorted_self_capacitance(output_path, reference, number, kind="Zhd",
+                             bands=((3e6, 30e6), (3e6, 40e6), (5e6, 45e6)),
+                             series_nh=(0.0, 60.0, 120.0)):
+    f, Y = load_admittance(output_path, reference, number, kind)
+    y_all = Y.mean(axis=0)
+    values = []
+    for band in bands:
+        keep = (f >= band[0]) & (f <= band[1])
+        w, y = 2 * numpy.pi * f[keep], y_all[keep]
+        for Ls in series_nh:
+            # Series path at the port: remove it first.
+            z_port = 1.0 / y - 1j * w * Ls * NANO
+            y_core = 1.0 / z_port
+
+            def residuals(v):
+                C, L0, L1, R0, R1 = v
+                f_mhz = w / (2 * numpy.pi) / 1e6
+                z_leak = (R0 + R1 * numpy.sqrt(f_mhz)) + 1j * w * (L0 + L1 / numpy.sqrt(f_mhz)) * NANO
+                model = 1.0 / z_leak + 1j * w * C * PICO
+                e = (model - y_core) / y_core
+                return numpy.concatenate([e.real, e.imag])
+
+            s = least_squares(residuals, [8.0, 500.0, 50.0, 0.5, 0.1],
+                              bounds=([-20, 0, -500, 0, 0], [100, 5000, 2000, 50, 50]))
+            values.append(float(s.x[0]))
+    values = numpy.array(values)
+    return {"value": float(numpy.mean(values)), "spread": float(numpy.std(values)),
+            "min": float(values.min()), "max": float(values.max())}
+
+
+def branches_from_blache(c):
+    """Inverse of blache_from_branches (same sign convention)."""
+    AC = -c["C12"]
+    AD = -c["C13"] - AC
+    BC = c["C23"] - AC
+    BD = c["C33"] - AC - AD - BC
+    AB = c["C11"] - AC - AD
+    CD = c["C22"] - AC - BC
+    return {"AB": AB, "CD": CD, "AC": AC, "AD": AD, "BC": BC, "BD": BD}
+
+
+def _self_capacitances(output_path, reference, kind, C33, C13, C23):
+    """C11, C22 from the shorted states, S from the open state, C12 from S.
+
+    S = C11 + eta^2 C22 + 2 eta C12 (eta ~ 1 here) is taken as the maximum of
+    the open-circuit Im(Y)/w over 1-10 MHz -- a lower bound on S (the core
+    term is <= 0), and on a ferrite whose permittivity relaxes it is the
+    value near the first resonance rather than a constant.
+    """
+    C11 = shorted_self_capacitance(output_path, reference, 9, kind)
+    C22 = shorted_self_capacitance(output_path, reference, 14, kind)
+    f, Y = load_admittance(output_path, reference, OPEN_REFERENCE, kind)
+    c = effective_capacitance(f, Y).mean(axis=0) / PICO
+    window = (f >= 1e6) & (f <= 10e6)
+    S = float(c[window].max())
+    C12 = (S - C11["value"] - C22["value"]) / 2.0
+    C12_spread = 0.5 * float(numpy.hypot(C11["spread"], C22["spread"]))
+    six = {"C11": C11["value"], "C12": C12, "C13": float(C13), "C22": C22["value"],
+           "C23": float(C23), "C33": float(C33)}
+    return {
+        "C11": C11, "C22": C22,
+        "C12": {"value": C12, "spread": C12_spread},
+        "S_open_pf": S,
+        "blache_six_pf": six,
+        "branches_pf": branches_from_blache(six),
     }

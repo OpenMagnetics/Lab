@@ -149,7 +149,14 @@ def page_summary(pdf, state, results, differential, warnings, calibration_meta):
              f"{abs(differential['u_open']['value'] - differential['u_short']['value']):.1f} pF apart"],
             ["Self-C, C11+η²C22+2ηC12", f"≥ {differential['self_capacitance_lower_bound_pf']:.1f} pF",
              "open-circuit, max over 1–10 MHz", "frequency-dependent"],
-            ["C11, C22, C12 separately", "not reported", "global fit not at noise level (p. 'Limits')", "—"],
+            ["C11 [BLA94]", f"{differential['C11']['value']:+.2f} pF", "shorted state 9, smooth-leakage fit",
+             f"±{max(differential['C11']['spread'], 1.0):.1f} sys."],
+            ["C22 [BLA94]", f"{differential['C22']['value']:+.2f} pF", "shorted state 14, smooth-leakage fit",
+             f"±{max(differential['C22']['spread'], 1.0):.1f} sys."],
+            ["C12 [BLA94]", f"{differential['C12']['value']:+.2f} pF", f"(S − C11 − C22)/2, S = {differential['S_open_pf']:.1f}",
+             f"±{max(differential['C12']['spread'], 1.0):.1f} sys."],
+            ["Branch caps AB/CD/AC/AD/BC/BD", " / ".join(f"{v:.1f}" for v in differential["branches_pf"].values()),
+             "equivalent circuit (pF)", "SPICE-ready"],
             ["Fixture: clamp→HI / clamp→GND", f"{differential['clamp_to_HI_pf']['value']:.2f} / "
              f"{differential['clamp_to_ground_pf']['value']:.2f} pF", "open-link differences (guarded)", "fixture"],
             ["Fixture: LINK net → GND", f"{differential['link_net_to_ground_pf']:.1f} pF",
@@ -599,11 +606,10 @@ def page_self_capacitance(pdf, state, reference, differential):
     ] + shape_lines + [
         "",
         "**Consequence",
-        "C11, C22 and C12 separately are not reported: the global nodal",
-        "fit does not describe the measured states to noise level on this",
-        "bench (see 'Method limits'). The defensible numbers are C33, C13,",
-        "C23 and this spectrum; for the first resonance use the",
-        "open-circuit curves directly.",
+        "C12 is taken as (S − C11 − C22)/2 with S = this curve's maximum",
+        "over 1–10 MHz. Where the curve falls after its peak (windings on",
+        "MnZn), S and therefore C12 are values near the first resonance,",
+        "not constants; use this curve directly for the open-circuit SRF.",
     ], size=8)
     pdf.savefig(figure)
     plt.close(figure)
@@ -618,8 +624,10 @@ def page_limits(pdf, state):
         "frequency, the leakage as a smooth proximity/skin model. Variable-projection Jacobian; 13–35 s per fit.",
         "Synthetic validation (test_capacitance_fit.py: relaxing lossy ferrite, dispersive leakage, 0.03 % noise): "
         "C11, C13, C22, C23, C33 recovered to 0.02 pF, C12 to ~2 pF, every fixture term recovered.",
-        "On this DUT the lumped model does not describe the data (2–7 % per-state residual), so its C11/C12/C22 "
-        "are NOT reported. It is the right tool for parts with lower-permittivity cores or shorter windings.",
+        "On real data it reaches 0.2–1 % per state once the bench is modelled as a guarded measurement with a "
+        "series path per configuration, but C11/C22/C12 then move by ±10 pF with where that path sits (it scales "
+        "the apparent C by ~1−2Ls/L): the reported C11/C22 come instead from the shorted states 9/14 with a "
+        "smooth-leakage fit, cross-checked against the pair differences to ~1 pF (4 pF on the noisier 14/15).",
         "",
         "**Identifiability, stated plainly",
         "Any capacitance whose voltage pattern lives only across the winding ports (C11, C22, C12) is "

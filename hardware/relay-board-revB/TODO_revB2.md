@@ -50,7 +50,16 @@ these are for the B2 respin and the software that drives it.
   automatically (calibrations/fixture_paths.json) and subtracts them from the LINK-shorted states:
   reciprocity -> ~2 %, Lsc -5 %. B2: equalise column/LINK path lengths.
 - [ ] Clamp arms (~13 nH each) and isolated-clamp coupling (~2 pF to GND) still need the operator
-  shorting-bar / empty-clamp step.
+  shorting-bar / empty-clamp step. It would also pin where the series path sits, which today limits
+  C11/C22/C12 to +-2-3 pF (path L scales the apparent shorted-state C by ~1-2Ls/L).
+- [x] C11/C22/C12 reported (2026-10-11): C11/C22 from shorted states 9/14 (smooth-leakage fit over
+  3-45 MHz), C12 from the open-circuit S; branch capacitors all positive within error on both DUTs.
+- [ ] Toroid only: C13+C23 from the open links (-0.5 pF) and from the short pairs (-2.9 pF) differ by
+  2.5 pF (RM agrees to 0.5 pF). Hypothesis: windings directly on MnZn see a different voltage
+  distribution in leakage-driven (shorted) states than in core-driven (open) ones, which a lumped
+  six-capacitance model cannot represent. Test with a toroid wound on a non-conductive spacer.
+- [ ] Low-frequency reciprocity residual (~2 % at 10 kHz, ~10 mohm of 0.5 ohm) is contact-resistance
+  repeatability (SHORT re-actuation residuals 0.3-4.6 mohm per path).
 - [ ] **Isolated-clamp capacitance** (~1 pF to HI and to GND per floating
   terminal) remains; it is what is left between the open-family links and
   direct C33 (+4 pF on a 1:1 part). Candidate for the clamp-plane residual step.

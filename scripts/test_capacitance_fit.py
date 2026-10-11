@@ -48,6 +48,15 @@ TRUTH = {
 }
 
 
+# Per-configuration series paths outside the OSL, of the size measured on the
+# rev B board (fixture_paths.json): tens of nH and ~0.1 ohm, different for
+# every configuration.
+_paths = numpy.random.default_rng(11)
+for _n in range(1, 20):
+    TRUTH[f"Ls_cfg{_n:02d}"] = float(_paths.uniform(-40.0, 90.0))
+    TRUTH[f"Rs_cfg{_n:02d}"] = float(_paths.uniform(0.0, 0.15))
+
+
 def make_dataset(seed=1, noise=3e-4, configs=None):
     configs = configs or list(range(1, 20))
     frequency = numpy.geomspace(2e5, 5e7, 120)
