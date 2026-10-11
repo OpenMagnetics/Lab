@@ -283,6 +283,42 @@ class MagneticMeasurer:
         return self._sweep(start_frequency, stop_frequency, number_of_measurement_cycles,
                            number_of_measurement_points, source_power_dbm, ":CALC:FORM SLIN", columns)
 
+    #: Segmented receiver bandwidth for capacitance-grade sweeps. Measured
+    #: on the rev B bench (bench_accuracy.py, 2026-10-11): relative noise falls
+    #: roughly as 1/sqrt(RBW), and the high-impedance states (C33 below 1 MHz,
+    #: ~1 Mohm) are the worst -- 4500 ppm at 300 Hz, 1500 ppm at 30 Hz -- while
+    #: above 1 MHz 300 Hz is already at the tens-of-ppm level. A narrow RBW
+    #: only where it pays costs ~1.5x the sweep time instead of 9x.
+    SEGMENTS = ((1e4, 1e5, "30Hz"), (1e5, 1e6, "100Hz"), (1e6, 5e7, "300Hz"))
+
+    def take_Z_phase_segmented(self, start_frequency, stop_frequency, number_of_measurement_cycles,
+                               points_per_decade, source_power_dbm=None, segments=None):
+        """Z/phase sweep built from log segments, each at its own RBW.
+
+        Segments are clipped to [start, stop]; a shared edge frequency is
+        measured once (by the lower segment). Cycles are interleaved per
+        segment, so every cycle covers the whole band before the next.
+        """
+        segments = segments or self.SEGMENTS
+        saved_bandwidth = self.receiver_bandwidth
+        frames = []
+        try:
+            for low, high, bandwidth in segments:
+                low, high = max(low, start_frequency), min(high, stop_frequency)
+                if high <= low:
+                    continue
+                points = max(2, int(round(numpy.log10(high / low) * points_per_decade)) + 1)
+                self.receiver_bandwidth = bandwidth
+                data = self.take_Z_phase_measurement(low, high, number_of_measurement_cycles, points,
+                                                     source_power_dbm)
+                if frames:
+                    data = data[data.frequency > frames[-1].frequency.max() * (1 + 1e-9)]
+                frames.append(data)
+        finally:
+            self.receiver_bandwidth = saved_bandwidth
+        return pandas.concat(frames, ignore_index=True).sort_values(["measurement_index", "frequency"],
+                                                                    ignore_index=True)
+
     def take_Cs_measurement(self, start_frequency=10000, stop_frequency=1000000,
                             number_of_measurement_cycles=2, number_of_measurement_points=201,
                             source_power_dbm=None):

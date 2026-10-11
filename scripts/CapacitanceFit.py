@@ -374,7 +374,10 @@ class Dataset:
             z = (data.magnitude.to_numpy() * numpy.exp(1j * numpy.radians(data.phase.to_numpy())))
             z = z.reshape(cycles, -1)                                   # (cycles, all points)
             all_frequencies = data.frequency.to_numpy()[: z.shape[1]]
-            pick = numpy.searchsorted(all_frequencies, grid)
+            # Nearest point of THIS sweep's grid (segmented sweeps differ).
+            pick = numpy.clip(numpy.searchsorted(all_frequencies, grid), 1, len(all_frequencies) - 1)
+            pick = numpy.where(numpy.abs(all_frequencies[pick - 1] - grid) < numpy.abs(all_frequencies[pick] - grid),
+                               pick - 1, pick)
             values = z[:, pick].T                                       # (F, cycles)
             if cycle is None:
                 mean = values.mean(axis=1)
@@ -745,7 +748,29 @@ def load_admittance(output_path, reference, number, kind="Zhd"):
     data = pandas.read_csv(path).sort_values(["measurement_index", "frequency"])
     cycles = data.measurement_index.nunique()
     z = (data.magnitude.to_numpy() * numpy.exp(1j * numpy.radians(data.phase.to_numpy()))).reshape(cycles, -1)
-    return data.frequency.to_numpy()[: z.shape[1]], 1.0 / z
+    return data.frequency.to_numpy()[: z.shape[1]], 1.0 / reject_outliers(z)
+
+
+def reject_outliers(z, threshold=6.0):
+    """Replace per-point outliers across cycles by the per-point median.
+
+    Robust on the COMPLEX samples (so magnitude is never averaged, which
+    biases it upward in noise): a cycle whose distance from the complex median
+    exceeds `threshold` x 1.4826 x MAD of that point is treated as a glitch
+    (relay chatter, a transient). With fewer than 3 cycles nothing is done.
+    """
+    if z.shape[0] < 3:
+        return z
+    median = numpy.median(z.real, axis=0) + 1j * numpy.median(z.imag, axis=0)
+    distance = numpy.abs(z - median)
+    mad = numpy.median(distance, axis=0) * 1.4826
+    floor = 1e-6 * numpy.abs(median)
+    outliers = distance > threshold * numpy.maximum(mad, floor)
+    if not outliers.any():
+        return z
+    cleaned = z.copy()
+    cleaned[outliers] = numpy.broadcast_to(median, z.shape)[outliers]
+    return cleaned
 
 
 def effective_capacitance(frequency, admittance):

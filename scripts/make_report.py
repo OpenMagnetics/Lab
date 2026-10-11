@@ -58,15 +58,49 @@ def load(reference, number, kind):
     return tm.average_cycles(pandas.read_csv(path)) if path.exists() else None
 
 
-def new_page(pdf_state, title, subtitle=None):
+def new_page(pdf_state, title, subtitle=None, numbered=True):
+    """A report page; section numbers, header and footer are added here and
+    in PageCollector.write (which knows the page count)."""
     figure = plt.figure(figsize=PAGE)
     pdf_state["page"] += 1
-    figure.text(0.04, 0.955, title, fontsize=15, fontweight="bold", color=INK)
+    if numbered:
+        pdf_state["section"] = pdf_state.get("section", 0) + 1
+        title = f"{pdf_state['section']}. {title}"
+    figure.text(0.04, 0.925, title, fontsize=15, fontweight="bold", color=INK)
     if subtitle:
-        figure.text(0.04, 0.925, subtitle, fontsize=9, color=INK2)
-    figure.text(0.96, 0.02, f"{pdf_state['reference']}  ·  page {pdf_state['page']}",
-                fontsize=7, color=MUTED, ha="right")
+        figure.text(0.04, 0.895, subtitle, fontsize=9, color=INK2)
     return figure
+
+
+class PageCollector:
+    """Collects pages so every one can carry 'page x of y'; writes the PDF."""
+
+    def __init__(self):
+        self.figures = []
+
+    def savefig(self, figure):
+        self.figures.append(figure)
+
+    def write(self, destination, state):
+        total = len(self.figures)
+        header = f"{state['report_id']}  ·  {state['reference']}"
+        with PdfPages(destination) as pdf:
+            for index, figure in enumerate(self.figures, start=1):
+                figure.text(0.04, 0.975, "OpenMagnetics Lab — magnetic component characterization",
+                            fontsize=7, color=MUTED)
+                figure.text(0.96, 0.975, header, fontsize=7, color=MUTED, ha="right")
+                figure.add_artist(plt.Line2D([0.04, 0.96], [0.965, 0.965], color=GRID, linewidth=0.8,
+                                             transform=figure.transFigure))
+                figure.text(0.04, 0.02, f"Issued {state['issued']}  ·  results relate only to the item tested",
+                            fontsize=7, color=MUTED)
+                figure.text(0.96, 0.02, f"Page {index} of {total}", fontsize=7, color=MUTED, ha="right")
+                if index == total:
+                    figure.text(0.5, 0.045, "— End of report —", fontsize=8, color=INK2, ha="center")
+                pdf.savefig(figure)
+            info = pdf.infodict()
+            info["Title"] = f"{state['report_id']} — {state['reference']}"
+            info["Subject"] = "Magnetic component characterization (Bode 100 + relay board rev B)"
+            info["Author"] = state.get("operator") or "OpenMagnetics Lab"
 
 
 def text_block(figure, x, y, lines, size=8.5, width=None, color=INK, line_height=None):
@@ -123,9 +157,13 @@ def page_summary(pdf, state, results, differential, warnings, calibration_meta):
         rows += [
             ["Coupling coefficient k", f"{magnetic['k']:.5f}", "[COG94] from L0, Lsc at 10 kHz", "good"],
             ["Turns ratio N2/N1", f"{magnetic['turns_ratio_N2_N1']:.4f}", "eta = sqrt(L0'/L0)", "good"],
-            ["Open-circuit inductance L0", f"{magnetic['L0']*1e6:.2f} µH", "0 dBm, 10 kHz", "drive-dependent"],
+            ["Open-circuit inductance L0", f"{magnetic['L0']*1e6:.2f} µH",
+             f"{results.get('drive_linearity', {}).get('small_signal_dbm', 0):+d} dBm, "
+             f"{magnetic.get('reference_frequency', 1e4)/1e3:.0f} kHz", "small-signal"],
             ["Magnetizing inductance Lp", f"{magnetic['Lp_magnetizing']*1e6:.2f} µH", "L0 (1+k)/2", "drive-dependent"],
-            ["Leakage inductance ls", f"{magnetic['ls_leakage']*1e6:.3f} µH", "Lsc / k", "includes ~2 arms"],
+            ["Leakage inductance ls", f"{magnetic['ls_leakage']*1e6:.3f} µH",
+             f"Lsc/k at {magnetic.get('leakage_reference_frequency', 1e4)/1e3:.0f} kHz, board path removed",
+             "f-dependent"],
             ["Mutual M (Lcum, Ldif)", f"{magnetic.get('M', float('nan'))*1e6:.2f} µH",
              f"k from M: {magnetic.get('k_from_mutual', float('nan')):.4f}", "cross-check"],
         ]
@@ -193,7 +231,6 @@ def page_summary(pdf, state, results, differential, warnings, calibration_meta):
         "(their shared absolute level); it is a systematic, not a statistical, uncertainty.",
     ], width=150, size=8)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def page_findings(pdf, state):
@@ -247,7 +284,6 @@ def page_findings(pdf, state):
     text_block(figure, 0.04, 0.88, left, width=82, size=8.2)
     text_block(figure, 0.52, 0.88, right, width=82, size=8.2)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def page_calibration(pdf, state, calibration_meta):
@@ -266,7 +302,6 @@ def page_calibration(pdf, state, calibration_meta):
           ["Signal path", "Acquired", "OPEN (Ω)", "SHORT (mΩ)", "LOAD (Ω)", "SHORT re-act. (mΩ)", "Check"],
           rows, col_widths=[0.13, 0.17, 0.11, 0.11, 0.11, 0.15, 0.17], size=7.5)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def page_inductance(pdf, state, reference):
@@ -308,7 +343,6 @@ def page_inductance(pdf, state, reference):
     if d0 is not None and dsc is not None:
         axes[2].set_ylim(0.99, 1.0005)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def page_linearity_resistance(pdf, state, reference):
@@ -333,7 +367,6 @@ def page_linearity_resistance(pdf, state, reference):
         if axis.get_legend_handles_labels()[0]:
             axis.legend(loc="best")
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def _subtract_path(data, path):
@@ -398,7 +431,6 @@ def page_reciprocity(pdf, state, reference):
         "(fixture_paths.json) and subtracted, it closes to ~2 % — switching is correct and Lsc is corrected by the same "
         "path. A relay in the wrong state would give errors of orders of magnitude."], width=175)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def pages_all_sweeps(pdf, state, reference):
@@ -408,7 +440,7 @@ def pages_all_sweeps(pdf, state, reference):
         chunk = numbers[start:start + per_page]
         figure = new_page(state, "Impedance sweeps, all configurations (10 kHz – 50 MHz, 801 pts × 4 cycles)",
                           "|Z| above, phase below; band = min..max over the four cycles")
-        grid = figure.add_gridspec(4, 3, left=0.06, right=0.98, top=0.88, bottom=0.09, hspace=0.6, wspace=0.25,
+        grid = figure.add_gridspec(4, 3, left=0.06, right=0.98, top=0.84, bottom=0.09, hspace=0.6, wspace=0.25,
                                    height_ratios=[1.6, 1, 1.6, 1])
         for i, number in enumerate(chunk):
             row, column = (i // 3) * 2, i % 3
@@ -435,7 +467,6 @@ def pages_all_sweeps(pdf, state, reference):
             plt.setp(mag_ax.get_xticklabels(), visible=False)
             ph_ax.set_xlabel("Frequency (Hz)")
         pdf.savefig(figure)
-        plt.close(figure)
 
 
 def page_electrostatic(pdf, state, reference, differential):
@@ -473,7 +504,6 @@ def page_electrostatic(pdf, state, reference, differential):
         "uncalibrated arms/columns plus the winding path.",
     ], size=8)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def page_open_family(pdf, state, reference, differential, before):
@@ -510,7 +540,6 @@ def page_open_family(pdf, state, reference, differential, before):
             f"{k} − BD: {v:+.2f} pF" for k, v in before.items()]
     text_block(figure, 0.60, 0.58, lines, size=8)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def page_short_pairs(pdf, state, reference, differential):
@@ -558,7 +587,6 @@ def page_short_pairs(pdf, state, reference, differential):
         "level the pair cannot pin.",
     ], size=8)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def page_self_capacitance(pdf, state, reference, differential):
@@ -612,7 +640,6 @@ def page_self_capacitance(pdf, state, reference, differential):
         "not constants; use this curve directly for the open-circuit SRF.",
     ], size=8)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 def page_limits(pdf, state):
@@ -658,10 +685,205 @@ def page_limits(pdf, state):
     text_block(figure, 0.04, 0.88, left, width=82, size=8.2)
     text_block(figure, 0.52, 0.88, right, width=82, size=8.2)
     pdf.savefig(figure)
-    plt.close(figure)
 
 
 # ------------------------------------------------------------------ main
+
+def report_metadata(reference, results, calibration_meta, overrides):
+    """Everything a test report must identify (ISO/IEC 17025 7.8 style)."""
+    import platform
+    import subprocess
+    import numpy as np, scipy, pandas as pd
+    meta = {"reference": reference}
+    dut = OUTPUT / f"{reference}_dut.json"
+    if dut.exists():
+        meta.update(json.loads(dut.read_text()))
+    meta.update({k: v for k, v in overrides.items() if v})
+    files = sorted(OUTPUT.glob(f"{reference}_cfg*.csv"))
+    if files:
+        stamps = [f.stat().st_mtime for f in files]
+        meta["measured_from"] = datetime.datetime.fromtimestamp(min(stamps)).strftime("%Y-%m-%d %H:%M")
+        meta["measured_to"] = datetime.datetime.fromtimestamp(max(stamps)).strftime("%Y-%m-%d %H:%M")
+    try:
+        commit = subprocess.run(["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"], capture_output=True,
+                                text=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(HERE), "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True).stdout.strip()
+        meta["software"] = f"{commit}{' (uncommitted changes)' if dirty else ''}"
+    except OSError:
+        meta["software"] = "unknown"
+    meta["python"] = f"Python {platform.python_version()}, numpy {np.__version__}, scipy {scipy.__version__}, pandas {pd.__version__}"
+    any_meta = next(iter(calibration_meta.values()), {})
+    meta["analyzer"] = any_meta.get("bode_100", "")
+    meta["relay_board"] = any_meta.get("relay_board", "")
+    return meta
+
+
+def page_cover(pdf, state, meta, results):
+    figure = new_page(state, "", numbered=False)
+    figure.text(0.08, 0.80, "Test report", fontsize=14, color=INK2)
+    figure.text(0.08, 0.73, "Magnetic component characterization", fontsize=26, fontweight="bold", color=INK)
+    figure.text(0.08, 0.68, f"{meta['reference']}" + (f" — {meta['description']}" if meta.get("description") else ""),
+                fontsize=14, color=INK)
+    rows = [
+        ["Report ID", state["report_id"]],
+        ["Laboratory", "OpenMagnetics Lab (bench: Bode 100 + relay board rev B)"],
+        ["Item tested", f"{meta['reference']}" + (f" ({meta['description']})" if meta.get("description") else "")],
+        ["Measured", f"{meta.get('measured_from', '?')} – {meta.get('measured_to', '?')}"],
+        ["Issued", state["issued"]],
+        ["Operator", meta.get("operator") or "not recorded"],
+        ["Ambient", meta.get("ambient") or "not recorded"],
+        ["Software", meta.get("software", "")],
+    ]
+    table(figure, [0.08, 0.30, 0.84, 0.32], ["", ""], rows, col_widths=[0.2, 0.8], size=9)
+    table(figure, [0.08, 0.10, 0.84, 0.12], ["Rev.", "Date", "Author", "Change"],
+          [["A", state["issued"], meta.get("operator") or "auto-generated", "First issue"]],
+          col_widths=[0.08, 0.2, 0.25, 0.47], size=8)
+    figure.text(0.08, 0.075, "Prepared by: ______________________      Approved by: ______________________      "
+                "Date: ____________", fontsize=9, color=INK2)
+    pdf.savefig(figure)
+
+
+def page_conditions(pdf, state, meta, results, calibration_meta):
+    figure = new_page(state, "Test conditions, equipment and traceability")
+    drive = results.get("drive_linearity", {})
+    magnetic = results.get("magnetic", {})
+    rows = [
+        ["Method", "IAD impedance (B-WIC-type bridge integrated on the relay board), per-path automatic OSL"],
+        ["Inductance", f"RL 100 Hz–1 MHz, 201 pts × 2; open at {drive.get('small_signal_dbm', 0):+d} dBm, "
+                       f"shorts at 0 dBm"],
+        ["Read-out", f"L0 at {magnetic.get('reference_frequency', 1e4)/1e3:.0f} kHz, leakage at "
+                     f"{magnetic.get('leakage_reference_frequency', 1e4)/1e3:.0f} kHz, resistances at the low-f plateau (0 dBm)"],
+        ["Capacitance", "Z 10 kHz–50 MHz, 801 pts × 4 at 13 dBm, RBW 300 Hz (7, 16–19: 30/100/300 Hz)"],
+        ["Drive sweep", ", ".join(f"{d:+d}" for d in drive.get("levels_dbm", [])) + " dBm at 10 kHz"],
+        ["Ambient", meta.get("ambient") or "not recorded"],
+        ["Analyzer", meta.get("analyzer", "")],
+        ["Relay board", meta.get("relay_board", "")],
+        ["Calibration", f"{len(calibration_meta)} signal paths, automatic OSL (100 Ω 0.1 % on-board LOAD), "
+                        f"re-acquired after 24 h or on board/analyzer/drive change"],
+        ["Board paths", "fixture_paths.json (board-only, DUT isolated), subtracted from LINK-shorted states"],
+        ["Software", meta.get("software", "")],
+        ["Runtime", meta.get("python", "")],
+    ]
+    table(figure, [0.04, 0.20, 0.92, 0.64], ["Item", "Detail"], rows, col_widths=[0.16, 0.84], size=8)
+    pdf.savefig(figure)
+
+
+def page_uncertainty(pdf, state, results, differential):
+    figure = new_page(state, "Measurement uncertainty and validity")
+    d = differential or {}
+    rows = [
+        ["Calibration (LOAD standard)", "≤ 0.01 % at ≥ 0 dBm, 0.09 % at −20 dBm", "Type B, bench_accuracy.py"],
+        ["Repeatability (cycle spread)", f"open-family differences {d.get('open_cycle_noise_pf', float('nan')):.3f} pF; "
+                                        "|Z| 18–90 ppm (open/short), 1500–3600 ppm C33 < 100 kHz", "Type A"],
+        ["C33", "± 0.05 pF", "forward = reverse to 0.001 pF; repeat within 0.02 pF"],
+        ["C13 / C23", f"± {d.get('C13', {}).get('spread', 0):.1f} / ± {d.get('C23', {}).get('spread', 0):.1f} pF",
+         "spread over bands and the shared short level (systematic)"],
+        ["C11 / C22 / C12", f"± {d.get('C11', {}).get('spread', 0):.1f} / ± {d.get('C22', {}).get('spread', 0):.1f} / "
+                            f"± {d.get('C12', {}).get('spread', 0):.1f} pF", "series-path placement scales apparent C by ~1−2Ls/L"],
+        ["Inductances", "± 0.5 % (small-signal tolerance)", "plus drive dependence: see amplitude-permeability page"],
+        ["Leakage", "frequency-dependent (proximity); 100 kHz value reported", "board path removed (±few nH arms remain)"],
+        ["Winding resistance", "+~100 mΩ fixture (two-terminal)", "Kelvin path needed (TODO B2)"],
+        ["Validity range", "lumped results 0.5–12 MHz; models fitted 10 kHz–30 MHz", "see 'Method limits'"],
+    ]
+    table(figure, [0.04, 0.30, 0.92, 0.54], ["Quantity", "Uncertainty", "Basis"], rows,
+          col_widths=[0.22, 0.4, 0.38], size=8)
+    text_block(figure, 0.04, 0.26, [
+        "Uncertainties are stated as observed spreads (no formal coverage factor). Values marked 'systematic' come from "
+        "varying analysis choices that the data cannot pin down; they dominate the statistical (cycle) contribution."],
+        width=180, size=8)
+    pdf.savefig(figure)
+
+
+def page_model_vs_data(pdf, state, reference, results):
+    try:
+        import SpiceModel as sm
+        parameters = sm.broadband_parameters(reference, results)
+        model = sm.broadband_subcircuit(reference, parameters)
+        sm.NgSpice.get()
+    except Exception as error:
+        print(f"  (model-vs-data page skipped: {error})")
+        return None
+    figure = new_page(state, "Model vs data — broadband SPICE model in every configuration",
+                      f"ngspice; leakage fit {parameters['leakage']['median_error']*100:.1f} %, core + dielectric fit "
+                      f"{parameters['shunt']['median_error']*100:.1f} %; dashed = model, solid = measured (13 dBm)")
+    axes = figure.subplots(1, 2, gridspec_kw=dict(left=0.06, right=0.70, top=0.84, bottom=0.12, wspace=0.28))
+    fixture = sm.fixture_terms(results)
+    errors = []
+    for index, number in enumerate(range(1, 17)):
+        try:
+            f, Y = cfit.load_admittance(str(OUTPUT), reference, number)
+        except FileNotFoundError:
+            continue
+        zm = 1 / Y.mean(0)
+        fs, zs = sm.simulate(results, number, fixture, model=model)
+        zi = numpy.interp(f, fs, zs.real) + 1j * numpy.interp(f, fs, zs.imag)
+        band = f <= 1e7
+        errors.append([f"{number} {rbc.CONFIGS[number]['name']}", f"{numpy.median(numpy.abs(zi[band]/zm[band]-1))*100:.1f}"])
+        if number in (1, 2, 7, 12):
+            color = SERIES[[1, 2, 7, 12].index(number)]
+            axes[0].plot(f, numpy.abs(zm), color=color, label=f"{number} {rbc.CONFIGS[number]['name']}")
+            axes[0].plot(fs, numpy.abs(zs), color=color, linestyle="--")
+            axes[1].plot(f, numpy.degrees(numpy.angle(zm)), color=color)
+            axes[1].plot(fs, numpy.degrees(numpy.angle(zs)), color=color, linestyle="--")
+    for axis in axes:
+        log_frequency_axis(axis)
+    axes[0].set_yscale("log")
+    axes[0].set_ylabel("|Z| (Ω)")
+    axes[1].set_ylabel("phase (°)")
+    axes[0].legend(loc="lower right")
+    table(figure, [0.73, 0.12, 0.25, 0.74], ["Configuration", "median err ≤10 MHz %"], errors,
+          col_widths=[0.65, 0.35], size=7)
+    pdf.savefig(figure)
+    return model
+
+
+def page_drive(pdf, state, reference, results):
+    drive = results.get("drive_linearity")
+    if not drive:
+        return
+    figure = new_page(state, "Amplitude permeability — inductance vs drive level",
+                      "Open circuit (config 1), RL sweeps; calibration is drive-independent (LOAD within ±0.05 % "
+                      "from −10 to +13 dBm), so the change is the core")
+    axes = figure.subplots(1, 2, gridspec_kw=dict(left=0.06, right=0.98, top=0.84, bottom=0.12, wspace=0.25))
+    axes[0].plot(drive["levels_dbm"], numpy.array(drive["L_10kHz"]) * 1e6, color=SERIES[0], marker="o")
+    axes[0].set_xlabel("Source level (dBm)")
+    axes[0].set_ylabel("L at 10 kHz (µH)")
+    axes[0].set_title(f"Reported at {drive['small_signal_dbm']:+d} dBm (within 0.5 % of the lowest level)")
+    for index, dbm in enumerate(drive["levels_dbm"]):
+        d = load(reference, 1, f"RL_drive{dbm:+d}dBm")
+        if d is not None:
+            axes[1].plot(d.frequency, d.inductance * 1e6, color=SERIES[index % len(SERIES)], label=f"{dbm:+d} dBm")
+    log_frequency_axis(axes[1])
+    axes[1].set_ylabel("L (µH)")
+    axes[1].legend(loc="upper right")
+    pdf.savefig(figure)
+
+
+def page_appendix(pdf, state, reference, model):
+    import hashlib
+    figure = new_page(state, "Appendix A — relay configurations and raw data")
+    rows = [[str(n), c["name"], "+".join(c["HI"]) or "—", "+".join(c["LO"]) or "—", "+".join(c["LINK"]) or "—",
+             rbc.signal_path(c)] for n, c in sorted(rbc.CONFIGS.items())]
+    table(figure, [0.04, 0.08, 0.50, 0.80], ["#", "name", "HI", "LO", "LINK", "calibration path"], rows,
+          col_widths=[0.06, 0.3, 0.12, 0.12, 0.12, 0.28], size=6.5)
+    files = sorted(OUTPUT.glob(f"{reference}_cfg*.csv"))
+    lines = ["**Raw data files (SHA-256, first 16 hex)"]
+    for path in files[:46]:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        lines.append(f"{path.name[len(reference) + 1:]:42s} {digest}")
+    if len(files) > 46:
+        lines.append(f"... {len(files) - 46} more")
+    text_block(figure, 0.57, 0.88, lines, size=6.2, line_height=0.0155)
+    pdf.savefig(figure)
+    if model:
+        figure = new_page(state, "Appendix B — broadband SPICE subcircuit (ngspice / LTspice)")
+        body = model[1]
+        half = (len(body) + 1) // 2
+        for x, chunk in ((0.04, body[:half]), (0.52, body[half:])):
+            figure.text(x, 0.87, "\n".join(chunk), fontsize=6.3, family="monospace", va="top", color=INK)
+        pdf.savefig(figure)
+
 
 def before_differences(reference):
     """Open link differences of an earlier run (Z sweeps, old fixture)."""
@@ -687,6 +909,9 @@ def main():
     parser.add_argument("reference")
     parser.add_argument("--before", default=None)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--operator", default=None)
+    parser.add_argument("--ambient", default=None, help='e.g. "23 °C, 45 %% RH"')
+    parser.add_argument("--revision", default="A")
     arguments = parser.parse_args()
     reference = arguments.reference
 
@@ -714,28 +939,38 @@ def main():
             pass
 
     destination = pathlib.Path(arguments.out) if arguments.out else OUTPUT / f"{reference}_report.pdf"
-    state = {"page": 0, "reference": reference,
-             "fixture_paths": results.get("fixture_paths")}
+    issued = datetime.datetime.now()
+    state = {"page": 0, "reference": reference, "fixture_paths": results.get("fixture_paths"),
+             "issued": issued.strftime("%Y-%m-%d"),
+             "report_id": f"OML-{reference}-{issued:%Y%m%d}-{arguments.revision}"}
     dut_path = OUTPUT / f"{reference}_dut.json"
     if dut_path.exists():
         state["description"] = json.loads(dut_path.read_text()).get("description")
+    meta = report_metadata(reference, results, calibration_meta,
+                           {"operator": arguments.operator, "ambient": arguments.ambient})
+    state["operator"] = meta.get("operator")
     before = before_differences(arguments.before) if arguments.before else None
-    with PdfPages(destination) as pdf:
-        page_summary(pdf, state, results, differential, warnings, calibration_meta)
-        page_findings(pdf, state)
-        page_calibration(pdf, state, calibration_meta)
-        page_inductance(pdf, state, reference)
-        page_linearity_resistance(pdf, state, reference)
-        page_reciprocity(pdf, state, reference)
-        page_electrostatic(pdf, state, reference, differential)
-        page_open_family(pdf, state, reference, differential, before)
-        page_short_pairs(pdf, state, reference, differential)
-        page_self_capacitance(pdf, state, reference, differential)
-        pages_all_sweeps(pdf, state, reference)
-        page_limits(pdf, state)
-        info = pdf.infodict()
-        info["Title"] = f"Magnetic characterization — {reference}"
-        info["Subject"] = "Bode 100 + OpenMagnetics relay board rev B"
+    pdf = PageCollector()
+    page_cover(pdf, state, meta, results)
+    page_summary(pdf, state, results, differential, warnings, calibration_meta)
+    page_conditions(pdf, state, meta, results, calibration_meta)
+    page_uncertainty(pdf, state, results, differential)
+    page_findings(pdf, state)
+    page_calibration(pdf, state, calibration_meta)
+    page_inductance(pdf, state, reference)
+    page_drive(pdf, state, reference, results)
+    page_linearity_resistance(pdf, state, reference)
+    page_reciprocity(pdf, state, reference)
+    page_electrostatic(pdf, state, reference, differential)
+    page_open_family(pdf, state, reference, differential, before)
+    page_short_pairs(pdf, state, reference, differential)
+    page_self_capacitance(pdf, state, reference, differential)
+    model = page_model_vs_data(pdf, state, reference, results)
+    pages_all_sweeps(pdf, state, reference)
+    page_limits(pdf, state)
+    page_appendix(pdf, state, reference, model)
+    pdf.write(destination, state)
+    state["page"] = len(pdf.figures)
     print(f"Wrote {destination} ({state['page']} pages)")
 
 

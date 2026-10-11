@@ -9,3 +9,5 @@ numpy
 trimesh
 manifold3d
 rtree
+streamlit
+plotly

@@ -45,7 +45,12 @@ class MagneticCharacterizer:
     #: four cycles so every point carries its own repeatability. The
     #: differential estimators need the whole band and the cycle scatter.
     CAPACITANCE_SWEEP = dict(band=(10_000.0, 50_000_000.0), points=801, cycles=4,
-                             drive_dbm=13)
+                             drive_dbm=13, points_per_decade=216,
+                             # Narrow-RBW segments only where they pay: the
+                             # electrostatic states sit near 1 Mohm below 1 MHz
+                             # (3x lower noise, 3.7x the time); open and short
+                             # states are already at 18-90 ppm at 300 Hz.
+                             segmented_configs=(7, 16, 17, 18, 19))
     CAPACITANCE_CONFIGS = (7, 16, 17, 18, 19, 1, 8, 10, 12, 13, 3, 2, 9, 11, 4, 14, 15, 5, 6)
 
     #: [COG94] III: lower drive at low frequency to avoid core saturation,
@@ -55,7 +60,7 @@ class MagneticCharacterizer:
     DRIVE_HIGH_BAND_DBM = 13
 
     def __init__(self, reference="temp", relay_board_port=None, bode_ip=None,
-                 auto_calibrate=True):
+                 auto_calibrate=True, offline=False):
         self.reference = reference
         self.auto_calibrate = auto_calibrate
 
@@ -73,7 +78,12 @@ class MagneticCharacterizer:
         # Sweeps taken in this session, keyed by everything that defines them,
         # so two recipes asking for the same sweep share one acquisition.
         self._session_sweeps = {}
+        self._dut_verified = False
 
+        if offline:
+            self.offline = True
+            print("*** OFFLINE by request -- cached CSVs only, nothing is measured.\n")
+            return
         try:
             kwargs = {"SCPI_server_IP": bode_ip} if bode_ip else {}
             self.bode_100 = Bode100Analyzer.MagneticMeasurer(**kwargs)
@@ -92,7 +102,7 @@ class MagneticCharacterizer:
 
     # --------------------------------------------------------- acquisition
 
-    def _cache_path(self, config_number, kind):
+    def _cache_path(self, config_number, kind, drive_dbm=None):
         name = rbc.CONFIGS[config_number]["name"]
         return self.output_path / f"{self.reference}_cfg{config_number:02d}_{name}_{kind}.csv"
 
@@ -274,7 +284,18 @@ class MagneticCharacterizer:
         if kind == "Zhd":
             sweep = self.CAPACITANCE_SWEEP
             band, points, cycles, drive_dbm = sweep["band"], sweep["points"], sweep["cycles"], sweep["drive_dbm"]
-        path = self._cache_path(config_number, kind)
+        start, stop = band or (self.INDUCTANCE_BAND if kind == "RL" else self.RESONANCE_BAND)
+        if drive_dbm is None:
+            low = getattr(self, "small_signal_dbm", self.DRIVE_LOW_BAND_DBM)
+            drive_dbm = low if start < 1000 else self.DRIVE_HIGH_BAND_DBM
+
+        # Low-band RL sweeps at a non-default drive get their own cache name,
+        # so a small-signal run never reads a 0 dBm file (older caches, all
+        # taken at 0 dBm, keep their names).
+        file_kind = kind
+        if kind == "RL" and start < 1000 and drive_dbm != self.DRIVE_LOW_BAND_DBM:
+            file_kind = f"RL_{drive_dbm:+d}dBm"
+        path = self._cache_path(config_number, file_kind)
         if allow_use_cache and path.exists():
             return pandas.read_csv(path)
         if self.offline:
@@ -282,10 +303,6 @@ class MagneticCharacterizer:
                 f"Offline and no cached sweep at {path.name}. Connect the "
                 "instruments, or run a configuration whose CSVs already exist."
             )
-
-        start, stop = band or (self.INDUCTANCE_BAND if kind == "RL" else self.RESONANCE_BAND)
-        if drive_dbm is None:
-            drive_dbm = self.DRIVE_LOW_BAND_DBM if start < 1000 else self.DRIVE_HIGH_BAND_DBM
 
         # Recipes overlap (inductance and losses both need configs 1 and 3).
         # Re-measuring used to overwrite the CSV another recipe had already
@@ -295,7 +312,14 @@ class MagneticCharacterizer:
         if key in self._session_sweeps:
             return self._session_sweeps[key]
 
+        self._verify_dut_identity()
         self._set_config(config_number)
+        if kind == "Zhd" and config_number in self.CAPACITANCE_SWEEP.get("segmented_configs", ()):
+            data = self.bode_100.take_Z_phase_segmented(
+                start, stop, cycles, self.CAPACITANCE_SWEEP["points_per_decade"], drive_dbm)
+            data.to_csv(path, index=False)
+            self._session_sweeps[key] = data
+            return data
         method = {"RL": self.bode_100.take_Rs_Ls_measurement,
                   "Z": self.bode_100.take_Z_phase_measurement,
                   "Zhd": self.bode_100.take_Z_phase_measurement,
@@ -307,6 +331,44 @@ class MagneticCharacterizer:
         data.to_csv(path, index=False)
         self._session_sweeps[key] = data
         return data
+
+    #: A clamped DUT is accepted as the reference's DUT when its open-circuit
+    #: |Z| matches the cached one this closely (median over the probe sweep).
+    DUT_IDENTITY_TOLERANCE = 0.05
+
+    def _verify_dut_identity(self):
+        """Refuse to write new sweeps for a reference whose cached data came
+        from a different DUT than the one now clamped.
+
+        A cached re-run of an earlier DUT would otherwise measure whatever is
+        on the bench and file it under the old reference. One quick Z0 sweep
+        is compared with the cached Z0 (any cached kind of config 1).
+        """
+        if self._dut_verified or self.offline:
+            return
+        cached = sorted(self.output_path.glob(f"{self.reference}_cfg01_Z0_*.csv"))
+        cached = [c for c in cached if not c.name.endswith(("_RL_drive_low.csv", "_RL_drive_high.csv"))]
+        if not cached:
+            self._dut_verified = True           # new reference: nothing to protect
+            return
+        reference_data = tm.average_cycles(pandas.read_csv(cached[0]))
+        self._set_config(1)
+        probe = tm.average_cycles(self.bode_100.take_Z_phase_measurement(
+            start_frequency=1e4, stop_frequency=1e5, number_of_measurement_cycles=1,
+            number_of_measurement_points=11, source_power_dbm=self.DRIVE_LOW_BAND_DBM))
+        if "magnitude" in reference_data:
+            ref_mag = numpy.interp(probe.frequency, reference_data.frequency, reference_data.magnitude)
+        else:
+            w = 2 * numpy.pi * reference_data.frequency
+            z = numpy.hypot(reference_data.resistance, w * reference_data.inductance)
+            ref_mag = numpy.interp(probe.frequency, reference_data.frequency, z)
+        mismatch = float(numpy.median(numpy.abs(probe.magnitude / ref_mag - 1)))
+        if mismatch > self.DUT_IDENTITY_TOLERANCE:
+            raise RuntimeError(
+                f"The clamped DUT does not match the cached data of '{self.reference}' "
+                f"(open-circuit |Z| differs by {mismatch*100:.0f}% at 10-100 kHz). Refusing to "
+                "write new sweeps under that reference: use --offline to replay it, or a new reference.")
+        self._dut_verified = True
 
     def value_at(self, data, frequency, parameter="inductance", tolerance=0.05):
         """Value at a frequency, refusing to silently return a far-off point.
@@ -465,32 +527,63 @@ class MagneticCharacterizer:
     #: Below this, a reciprocity error is fixture link impedance, not switching.
     RECIPROCITY_FIXTURE_LIMIT = 0.20
 
-    def verify_linearity(self, config_number=1, allow_use_cache=False):
-        """[COG94] III: acquire twice at two drive levels to prove linearity."""
-        print("\n-- Linearity check --")
-        low = self._cache_path(config_number, "RL_drive_low")
-        high = self._cache_path(config_number, "RL_drive_high")
-        if allow_use_cache and low.exists() and high.exists():
-            low_data, high_data = pandas.read_csv(low), pandas.read_csv(high)
-        elif self.offline:
-            print("  skipped (offline, no cached drive sweeps)")
-            return None
-        else:
-            self._set_config(config_number)
-            low_data = self.bode_100.take_Rs_Ls_measurement(
-                *self.INDUCTANCE_BAND, number_of_measurement_cycles=1, source_power_dbm=-10)
-            low_data.to_csv(low, index=False)
-            high_data = self.bode_100.take_Rs_Ls_measurement(
-                *self.INDUCTANCE_BAND, number_of_measurement_cycles=1, source_power_dbm=10)
-            high_data.to_csv(high, index=False)
+    #: Where leakage (shorted-state) inductance is read; see characterize_inductance.
+    LEAKAGE_REFERENCE_HZ = 100_000.0
 
-        passed, worst, _ = tm.check_linearity(low_data, high_data)
+    #: Drive levels of the amplitude-permeability sweep (dBm at the source).
+    DRIVE_LEVELS_DBM = (-20, -10, 0, 10, 13)
+    #: A level counts as small-signal while L stays within this of the lowest
+    #: level. Calibration itself is drive-independent (LOAD within +-0.05 %
+    #: from -10 to +13 dBm after one 13 dBm OSL, measured 2026-10-11).
+    SMALL_SIGNAL_TOLERANCE = 0.005
+
+    def verify_linearity(self, config_number=1, allow_use_cache=False):
+        """Amplitude-permeability sweep; picks the small-signal drive level.
+
+        [COG94] III asks for two drive levels to prove linearity. With few
+        turns the core runs at tens of mT at low frequency, so on MnZn the
+        inductance climbs with drive (a 10-turn 3C90 toroid: +16 % from -20 to
+        +13 dBm at 10 kHz) -- real core behaviour, not a bench artefact. The
+        sweep is reported as such, and the inductance recipes then run at the
+        highest drive still within SMALL_SIGNAL_TOLERANCE of the lowest one:
+        initial-permeability values with the best signal-to-noise.
+        """
+        print("\n-- Drive linearity (amplitude permeability) --")
+        sweeps = {}
+        for dbm in self.DRIVE_LEVELS_DBM:
+            path = self._cache_path(config_number, f"RL_drive{dbm:+d}dBm")
+            if allow_use_cache and path.exists():
+                sweeps[dbm] = pandas.read_csv(path)
+            elif self.offline:
+                print("  skipped (offline, no cached drive sweeps)")
+                return None
+            else:
+                self._set_config(config_number)
+                sweeps[dbm] = self.bode_100.take_Rs_Ls_measurement(
+                    *self.INDUCTANCE_BAND, number_of_measurement_cycles=2, source_power_dbm=dbm)
+                sweeps[dbm].to_csv(path, index=False)
+
+        reference = 10_000.0
+        inductance = {dbm: self.value_at(data, reference, "inductance")[1] for dbm, data in sweeps.items()}
+        lowest = min(self.DRIVE_LEVELS_DBM)
+        small = [dbm for dbm in self.DRIVE_LEVELS_DBM
+                 if abs(inductance[dbm] / inductance[lowest] - 1) <= self.SMALL_SIGNAL_TOLERANCE]
+        self.small_signal_dbm = max(small)
+        for dbm in self.DRIVE_LEVELS_DBM:
+            print(f"  {dbm:+4d} dBm: L(10 kHz) = {inductance[dbm]*1e6:9.3f} uH"
+                  f"{'   <- small-signal drive' if dbm == self.small_signal_dbm else ''}")
+        worst = abs(inductance[max(self.DRIVE_LEVELS_DBM)] / inductance[lowest] - 1)
+        self.results["drive_linearity"] = {
+            "levels_dbm": list(self.DRIVE_LEVELS_DBM),
+            "L_10kHz": [inductance[d] for d in self.DRIVE_LEVELS_DBM],
+            "small_signal_dbm": self.small_signal_dbm,
+        }
         self.results["linearity_deviation"] = worst
-        if passed:
-            print(f"  PASS -- inductance moves {worst*100:.2f}% over a 20 dB drive change")
-        else:
-            self.warn(f"NON-LINEAR ({worst*100:.1f}% inductance change over 20 dB). The "
-                      "six-capacitance model assumes linearity; lower the drive.")
+        passed = worst <= 0.02
+        if not passed:
+            self.warn(f"Inductance rises {worst*100:.1f}% from {lowest:+d} to "
+                      f"{max(self.DRIVE_LEVELS_DBM):+d} dBm (amplitude permeability). Inductances are "
+                      f"reported at {self.small_signal_dbm:+d} dBm, the highest small-signal level.")
         return passed
 
     # -------------------------------------------------- magnetic parameters
@@ -498,9 +591,14 @@ class MagneticCharacterizer:
     def characterize_inductance(self, allow_use_cache=False):
         """[COG94] II-B: k, eta, Lp and ls from three (here five) sweeps."""
         print("\n-- Inductance and coupling --")
-        sweeps = {name: self.measure(number, "RL", allow_use_cache)
-                  for name, number in (("Z0", 1), ("Zsc", 2), ("Z0p", 3),
-                                       ("Lcum", 5), ("Ldif", 6))}
+        # Core-driven (open) states at the small-signal drive; leakage-type
+        # (shorted, series-opposing) states carry almost no core flux, so they
+        # keep the default drive for signal-to-noise.
+        open_states = (("Z0", 1), ("Z0p", 3), ("Lcum", 5))
+        leakage_states = (("Zsc", 2), ("Ldif", 6))
+        sweeps = {name: self.measure(number, "RL", allow_use_cache) for name, number in open_states}
+        sweeps.update({name: self.measure(number, "RL", allow_use_cache, drive_dbm=self.DRIVE_LOW_BAND_DBM)
+                       for name, number in leakage_states})
 
         # [COG94] reads inductance off "the first ascending part" of the Bode
         # plot. Above that, self-capacitance inflates L by 1/(1-(f/fr)^2), so
@@ -528,10 +626,19 @@ class MagneticCharacterizer:
             self.warn(f"At {reference_frequency:.0f} Hz self-capacitance inflates the "
                       f"inductances by {lift*100:.1f}%. Start the RL sweep lower.")
 
+        # Leakage is read where it is reactive: at 10 kHz a shorted winding is
+        # ~0.5 ohm resistive against ~0.06 ohm of reactance, so Im(Z)/w is
+        # mostly noise (it moved 5 % with drive level). Datasheets quote it at
+        # 100 kHz for the same reason; self-capacitance lift there is checked.
+        leakage_frequency = min(self.LEAKAGE_REFERENCE_HZ,
+                                (first_resonance or 1e9) / 10.0)
         values = {}
         for name, data in sweeps.items():
             number = {"Z0": 1, "Zsc": 2, "Z0p": 3, "Lcum": 5, "Ldif": 6}[name]
-            _, values[name] = self.value_at(self._corrected(data, number), reference_frequency, "inductance")
+            frequency = leakage_frequency if name in ("Zsc", "Ldif") else reference_frequency
+            _, values[name] = self.value_at(self._corrected(data, number), frequency, "inductance")
+        print(f"  leakage read at {leakage_frequency/1e3:.0f} kHz (reactive), "
+              f"open-circuit at {reference_frequency/1e3:.0f} kHz")
         path_L, _ = self._path_correction(2)
         if path_L:
             print(f"  Lsc corrected for {path_L*1e9:.1f} nH of board path (fixture_paths.json)")
@@ -540,6 +647,7 @@ class MagneticCharacterizer:
             L0=values["Z0"], Lsc=values["Zsc"], L0_prime=values["Z0p"],
             L_cum=values["Lcum"], L_dif=values["Ldif"])
         summary["reference_frequency"] = reference_frequency
+        summary["leakage_reference_frequency"] = leakage_frequency
 
         if summary.get("dot_convention_swapped"):
             self.warn("Series-aiding and series-opposing came back swapped -- the "
@@ -564,8 +672,12 @@ class MagneticCharacterizer:
         if eta is None:
             eta = self.characterize_inductance(allow_use_cache)["eta"]
 
-        Z0_rl = self.measure(1, "RL", allow_use_cache)
-        Z0p_rl = self.measure(3, "RL", allow_use_cache)
+        # Winding resistance is read off the low-frequency plateau, where the
+        # signal is small: use the default drive, not the small-signal one
+        # (-20 dBm is too noisy at 100 Hz to show a plateau). The flux there
+        # is low anyway: the impedance is resistive.
+        Z0_rl = self.measure(1, "RL", allow_use_cache, drive_dbm=self.DRIVE_LOW_BAND_DBM)
+        Z0p_rl = self.measure(3, "RL", allow_use_cache, drive_dbm=self.DRIVE_LOW_BAND_DBM)
 
         # [COG94] II-C: "The low-frequency plateau of Z0 equals r1, and that of
         # Z0' equals eta^2*r2."  So the plateau of Z0' IS the physical secondary
@@ -863,7 +975,7 @@ class MagneticCharacterizer:
             print(f"  Primary self C11         {capacitance['C11']*1e12:.2f} pF")
             print(f"  Secondary self C22       {capacitance['C22']*1e12:.2f} pF")
 
-        print(f"\n  Small-signal measurement at {self.DRIVE_LOW_BAND_DBM}"
+        print(f"\n  Small-signal measurement at {getattr(self, 'small_signal_dbm', self.DRIVE_LOW_BAND_DBM)}"
               f"/{self.DRIVE_HIGH_BAND_DBM} dBm -- these are small-signal "
               "permeability values, not values at operating flux.")
 
@@ -894,6 +1006,8 @@ def main():
                         help="also run the multi-gap AC resistance recipe (needs manual re-gapping)")
     parser.add_argument("--gaps", nargs="*", default=None, help="gap labels for --ac-resistance")
     parser.add_argument("--no-auto-calibrate", action="store_true")
+    parser.add_argument("--offline", action="store_true",
+                        help="never connect to the instruments; replay cached sweeps only")
     parser.add_argument("--describe", default=None,
                         help="free-text DUT description (core, material, turns...), stored in "
                              "output/{reference}_dut.json and shown in the report")
@@ -908,8 +1022,9 @@ def main():
 
     characterizer = MagneticCharacterizer(
         reference=arguments.reference, relay_board_port=arguments.port,
-        bode_ip=arguments.bode_ip, auto_calibrate=not arguments.no_auto_calibrate)
-    characterizer.characterize_all(allow_use_cache=arguments.cache,
+        bode_ip=arguments.bode_ip, auto_calibrate=not arguments.no_auto_calibrate,
+        offline=arguments.offline)
+    characterizer.characterize_all(allow_use_cache=arguments.cache or arguments.offline,
                                    skip_ac_resistance=not arguments.ac_resistance)
     if arguments.ac_resistance and arguments.gaps:
         characterizer.characterize_ac_resistance(gap_labels=arguments.gaps,

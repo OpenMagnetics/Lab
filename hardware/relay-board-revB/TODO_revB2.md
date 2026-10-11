@@ -129,3 +129,10 @@ removed by construction, not detected afterwards.
   low frequency. At high frequency the aiding and opposing connections have
   different proximity loss, so validate it against a two-gap result before
   trusting it. Can be tried on cached CSVs.
+
+- [x] Calibration is drive- and RBW-independent (bench_accuracy.py, 2026-10-11): LOAD within 0.01 % at
+  >= 0 dBm, 0.09 % at -20 dBm, equal at 30 and 300 Hz RBW.
+- [ ] Board paths for Ldif (6) and the secondary-side shorts (14) are not measured; the broadband SPICE
+  model misses those two states by ~10 % for that reason (all other states 0.2-2.5 %).
+- [ ] `:SYST:ICAL:EXEC` (internal calibration) exists per OMICRON docs but was not exercised; consider
+  running it after the warm-up in `bench.py check`.

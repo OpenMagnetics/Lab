@@ -94,6 +94,19 @@ Current is sensed only in the LO rail (RC1 shunt), so strays from DUT/fixture no
 
 `characterize_capacitance` takes dense `Zhd` sweeps (10 kHz-50 MHz, 801 pts x 4 cycles) and runs `CapacitanceFit.differential_summary`: C33 direct (7, 16), ground (17-19), core-free open-link differences, and leakage-cancelling short pairs for C13/C23. The [BLA94] resonance solve is kept as `characterize_capacitance_resonance`. `CapacitanceFit.fit` is a global nodal fit (variable projection, core free per frequency) validated by `test_capacitance_fit.py`; on ferrite parts whose self-capacitance is dispersive it does not fit, and its C11/C12/C22 must not be reported. `make_report.py <reference>` builds the PDF report from cache.
 
+### One entry point: `scripts/bench.py`
+
+Every measurement, check, model and report is reproducible from `python scripts/bench.py <command>` (see its docstring): `check`, `characterize REF [--describe ...] [--offline]`, `report`, `spice`, `fixture-paths`, `column-map`, `drive`, `accuracy`, `link-cal`, `consistency`, `manual-check`, `firmware [--flash]`, `gui`, `tests`. Instrument commands start OMICRON's ScpiRunner themselves when nothing answers on port 5025. `BenchExperiments.py` holds the bring-up experiments as functions. `MagneticCharacterizer` refuses to write new sweeps under an existing reference when the clamped DUT's open-circuit |Z| differs from the cached one (wrong DUT on the bench); `--offline` replays without connecting.
+
+### Measurement settings that matter (bench-verified 2026-10-11)
+
+- Inductance: open states at the small-signal drive picked by `verify_linearity` (amplitude-permeability sweep -20..13 dBm; few-turn MnZn parts move 16 %), shorted states and winding resistances at 0 dBm (SNR), leakage read at 100 kHz (at 10 kHz the short is resistive and Im(Z)/w is noise; leakage also falls with frequency: proximity effect). RL caches at a non-default drive carry `_RL_<dBm>dBm` in the name.
+- Calibration is drive- and RBW-independent (LOAD within 0.01 % at >= 0 dBm, 0.09 % at -20 dBm; 30 Hz vs 300 Hz equal). Noise falls ~1/sqrt(RBW); electrostatic states (7, 16-19, ~1 Mohm below 1 MHz) use segmented RBW 30/100/300 Hz (`Bode100Analyzer.take_Z_phase_segmented`), the rest 300 Hz. Cycles are averaged as complex values after per-point MAD outlier rejection (`CapacitanceFit.reject_outliers`).
+
+### SPICE, GUI, report
+
+`SpiceModel.py REF` writes `output/REF.lib` with a small-signal subcircuit (coupled L, k, r1, r2, Rp, six branch caps) and a broadband one (Foster leakage ladder; RL + Debye RC shunt network fitted by NNLS to the open-circuit admittance -- the self-capacitance of ferrite parts is a lossy, relaxing dielectric; ideal transformer; interwinding caps) and simulates every relay configuration in ngspice (KiCad's `ngspice.dll`, in-process via ctypes) against the data. `scripts/gui/app.py` (Streamlit + Plotly; `bench.py gui`) browses results, sweeps, models, capacitance and fixture data, compares DUTs, and drives the bench. `make_report.py` produces an ISO/IEC 17025-style PDF (cover, traceability, uncertainty, model vs data, appendix with checksums and the netlist).
+
 ### Cache and offline mode
 
 Raw sweeps go to `scripts/output/{reference}_cfg{NN}_{configname}_{RL|Z|Cs}.csv` (plus `{reference}_acr_{label}_RL.csv`, `{reference}_ac_resistance.csv`, `{reference}_results.json`); `allow_use_cache=True` / `--cache` reads an existing CSV instead of re-measuring. Always use the cache when working on math/plotting rather than measurement. If either instrument fails to connect, the constructor silently sets `self.offline = True` and only cached data works.
