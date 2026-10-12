@@ -1,0 +1,2 @@
+- [Bench DUTs and setup](bench-duts-and-setup.md) — measured DUT references (T26 3C90 toroid, RM next), bench PC tools/paths, DFU driver
+- [Rev C design decisions](revc-design-decisions.md) — Kelvin, links, SHORT relays dropped, 4-layer/EMC/JLC, calibration, routing rules; was rev B2

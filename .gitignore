@@ -24,3 +24,6 @@ firmware/build/
 hardware/relay-board-revC/relay_board_preopt.kicad_pcb
 hardware/relay-board-revC/relay_board_faraday_input.kicad_pcb
 hardware/relay-board-revC/relay_board.ses
+hardware/relay-board-revC/devtools/fan_test.kicad_pcb
+hardware/relay-board-revC/devtools/*.json
+hardware/relay-board-revC/devtools/*.png
