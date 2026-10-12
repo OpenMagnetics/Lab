@@ -19,7 +19,9 @@ Resume (KiCad 10 interpreter, from hardware/relay-board-revC):
 pins PA3..PB2) cross the north-row/east lanes; maze_route.LAYER_COST now puts that group on
 B.Cu and the others on F.Cu (run v16 was testing this). If they still thrash, consider the
 lane order in generate_schematic.GPIO_PINS or rotating the MCU so its GPIO-rich side faces the
-drivers. Not yet run end-to-end: route_pcb --no-freerouting -> optimize_tracks -> parasitic_report
+drivers. Run v16 (layer split) also showed GPIO15 (PA0) and GPIO23 (PA1), adjacent north-row lanes to U4 p1 /
+U6 p2, ripping each other: check their lane order (GPIO23 -> nearer input should be the westmore
+pin) with devtools/astar_test.py before anything else. Not yet run end-to-end: route_pcb --no-freerouting -> optimize_tracks -> parasitic_report
 (coupling audit) -> faraday_review / kicad-happy emc skill. Then export_fab/export_jlcpcb.
 
 Done this session (all in source): rev B2 renamed rev C; EU EMC plan (EMC_COMPLIANCE.md);
