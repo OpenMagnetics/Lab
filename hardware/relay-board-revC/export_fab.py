@@ -10,7 +10,7 @@ import subprocess
 import sys
 import zipfile
 
-KICAD_CLI = r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe"
+KICAD_CLI = r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe"
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOARD = os.path.join(HERE, "relay_board.kicad_pcb")
 FAB = os.path.join(HERE, "fab")
@@ -50,7 +50,7 @@ def main():
     print("Gerbers:")
     run(["pcb", "export", "gerbers", "--layers", LAYERS,
          "--subtract-soldermask", "-o", FAB + os.sep, BOARD])
-    print("  11 layers")
+    print(f"  {len(LAYERS.split(','))} layers (4 copper; JLC04161H-7628: L1 F.Cu, L2 In1, L3 In2, L4 B.Cu)")
 
     print("Drill:")
     run(["pcb", "export", "drill", "--format", "excellon",

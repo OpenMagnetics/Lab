@@ -580,7 +580,7 @@ def page_short_pairs(pdf, state, reference, differential):
         f"primary pair (9 → 11): {dl['primary']['value']:+.1f} nH",
         f"secondary pair (14 → 15): {dl['secondary']['value']:+.1f} nH",
         "The far winding is shorted through a different rail and",
-        "columns in each state — the rev B2 SHORT asymmetry, now",
+        "columns in each state — the rev C SHORT asymmetry, now",
         "quantified; it would otherwise be read as ~tens of pF.",
         "",
         "Spread is over 4 analysis bands × 3 values of the shared",
@@ -667,7 +667,7 @@ def page_limits(pdf, state):
         "• Flash firmware 1.2.0 (config 8 fix, floating isolation) — the Python driver already compensates.",
         "• Remaining uncorrected: the clamp arms (~13 nH each, common to both directions) and the isolated-clamp "
         "coupling (~2 pF to GND, ~0.1 pF to HI). A shorting bar / empty-clamp step would remove both.",
-        "• Rev B2: keep the LINK rail and columns away from the ground plane (~14 pF to GND today) and equalise the "
+        "• Rev C: keep the LINK rail and columns away from the ground plane (~14 pF to GND today) and equalise the "
         "A-B and C-D column/LINK path lengths (±38 nH today); make the SHORT follow the DUT path.",
         "• Populate G6K-2F-RF-S (lower open-contact capacitance) as planned.",
         "• For C11/C22/C12 on ferrite parts: measure the core's complex permeability (single-turn or toroid "
@@ -783,7 +783,7 @@ def page_uncertainty(pdf, state, results, differential):
                             f"± {d.get('C12', {}).get('spread', 0):.1f} pF", "series-path placement scales apparent C by ~1−2Ls/L"],
         ["Inductances", "± 0.5 % (small-signal tolerance)", "plus drive dependence: see amplitude-permeability page"],
         ["Leakage", "frequency-dependent (proximity); 100 kHz value reported", "board path removed (±few nH arms remain)"],
-        ["Winding resistance", "+~100 mΩ fixture (two-terminal)", "Kelvin path needed (TODO B2)"],
+        ["Winding resistance", "+~100 mΩ fixture (two-terminal)", "Kelvin path needed (TODO rev C)"],
         ["Validity range", "lumped results 0.5–12 MHz; models fitted 10 kHz–30 MHz", "see 'Method limits'"],
     ]
     table(figure, [0.04, 0.30, 0.92, 0.54], ["Quantity", "Uncertainty", "Basis"], rows,

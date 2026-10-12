@@ -7,14 +7,17 @@ model and report of the rev B bring-up is reproducible from here.
     python bench.py characterize REF [--describe "T26 3C90 10+10 turns"] [--offline]
     python bench.py report REF [--before OLDREF]
     python bench.py spice REF              .lib (small-signal + broadband) and model-vs-data CSV
+    python bench.py board-info             relay board identity, serial, temperature, coil supply, wear
     python bench.py fixture-paths          board-only series paths (cached per board identity)
+    python bench.py fixture-compensation [--short-bar-nh N] [--kelvin]
+                                           one-time clamp-plane OPEN/SHORT per path (operator steps)
     python bench.py column-map             every column / LINK loop relative to column A
     python bench.py drive                  amplitude permeability + LOAD vs drive level
     python bench.py accuracy               RBW vs noise/time study, calibration vs drive
     python bench.py link-cal               Lcum with and without LINK in the OSL
     python bench.py consistency REF        model-independent checks on cached data
     python bench.py manual-check PREFIX ETA   ground-free check on an old manual-jumper dataset
-    python bench.py firmware [--flash]     build the STM32 firmware; --flash: SYST:DFU + dfu-util
+    python bench.py firmware [--board revC] [--flash]  build; --flash: SYST:DFU + dfu-util
     python bench.py gui                    launch the GUI (Streamlit)
     python bench.py tests                  run every offline test suite
 
@@ -118,6 +121,23 @@ def cmd_check(arguments):
         print(f"All {len(rbc.CONFIGS)} configurations x 4 modes verified by relay readback.")
 
 
+def cmd_board_info(arguments):
+    """Identity, serial, fixture temperature, coil supply, relay wear (no Bode needed)."""
+    import RelayBoardController as rbc
+    board = rbc.RelayBoardController(com_port=arguments.port)
+    print("Board:      ", board.identity, f"({board.revision}, {board.relay_count} relays)")
+    print("Serial:     ", board.serial() or "n/a (firmware < 2.0)")
+    temperature = board.temperature()
+    print("Temperature:", f"{temperature:.2f} C" if temperature is not None else "n/a")
+    coil = board.coil_supply()
+    print("Coil supply:", {1: "on", 0: "off", -1: "OVERCURRENT FAULT", None: "n/a"}[coil])
+    counts = board.relay_counts()
+    if counts:
+        print("Relay actuations:", ", ".join(f"K{i + 1}={n}" for i, n in enumerate(counts)))
+        print(f"  most used: K{counts.index(max(counts)) + 1} ({max(counts)}; G6K mechanical life ~5e6)")
+    board.visa_session.close()
+
+
 def cmd_characterize(arguments):
     command = [sys.executable, str(HERE / "MagneticCharacterizer.py"), arguments.reference,
                "--bode-ip", arguments.bode_ip]
@@ -165,6 +185,14 @@ def cmd_fixture_paths(arguments):
         c.characterize_fixture_paths(allow_use_cache=False)
 
 
+def cmd_fixture_compensation(arguments):
+    import MagneticCharacterizer as mc
+    with scpi_server(arguments.bode_ip):
+        c = mc.MagneticCharacterizer(reference="FIXTURE", relay_board_port=arguments.port,
+                                     bode_ip=arguments.bode_ip, kelvin=arguments.kelvin)
+        c.characterize_fixture_compensation(short_bar_h=arguments.short_bar_nh * 1e-9)
+
+
 def cmd_accuracy(arguments):
     with scpi_server(arguments.bode_ip):
         subprocess.run([sys.executable, str(HERE / "bench_accuracy.py"), "BENCH", "--bode-ip", arguments.bode_ip]
@@ -192,8 +220,8 @@ def cmd_firmware(arguments):
     opencm3 = TOOLS / "libopencm3"
     if not (opencm3 / "lib" / "libopencm3_stm32f0.a").exists():
         raise SystemExit(f"libopencm3 not built in {opencm3}: git clone it and make TARGETS=stm32/f0")
-    subprocess.run([make, "-C", str(ROOT / "firmware"), f"OPENCM3_DIR={opencm3.as_posix()}"],
-                   env=environment, check=True)
+    subprocess.run([make, "-C", str(ROOT / "firmware"), f"BOARD={arguments.board}",
+                    f"OPENCM3_DIR={opencm3.as_posix()}"], env=environment, check=True)
     if not arguments.flash:
         return
     import RelayBoardController as rbc
@@ -203,7 +231,8 @@ def cmd_firmware(arguments):
     board.enter_dfu()
     time.sleep(4)
     subprocess.run([str(dfu), "-d", "0483:df11", "-a", "0", "-s", "0x08000000:leave", "-D",
-                    str(ROOT / "firmware" / "build" / "relay_board.bin")], check=True)
+                    str(ROOT / "firmware" / "build" / arguments.board / "relay_board.bin")],
+                   check=True)
     time.sleep(4)
     print("Now running:", rbc.RelayBoardController(com_port=arguments.port).identity)
 
@@ -214,11 +243,13 @@ def cmd_gui(arguments):
 
 def cmd_tests(arguments):
     failures = 0
-    for script in ("test_model.py", "test_calibration.py", "test_capacitance_fit.py"):
+    for script in ("test_model.py", "test_calibration.py", "test_capacitance_fit.py",
+                   "FixtureCompensation.py", "combine_windings.py"):
         print(f"\n=== {script}")
         failures += subprocess.run([sys.executable, str(HERE / script)]).returncode != 0
-    print(f"\n=== verify_board.py")
-    failures += subprocess.run([sys.executable, str(ROOT / "hardware" / "relay-board-revB" / "verify_board.py")]).returncode != 0
+    for board in ("relay-board-revB", "relay-board-revC"):
+        print(f"\n=== {board}/verify_board.py")
+        failures += subprocess.run([sys.executable, str(ROOT / "hardware" / board / "verify_board.py")]).returncode != 0
     raise SystemExit(1 if failures else 0)
 
 
@@ -229,6 +260,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("server").set_defaults(func=cmd_server)
     sub.add_parser("check").set_defaults(func=cmd_check)
+    sub.add_parser("board-info").set_defaults(func=cmd_board_info)
     p = sub.add_parser("characterize")
     p.add_argument("reference")
     p.add_argument("--describe")
@@ -243,6 +275,10 @@ def main():
     p.add_argument("reference")
     p.set_defaults(func=cmd_spice)
     sub.add_parser("fixture-paths").set_defaults(func=cmd_fixture_paths)
+    p = sub.add_parser("fixture-compensation")
+    p.add_argument("--short-bar-nh", type=float, default=0.0)
+    p.add_argument("--kelvin", action="store_true")
+    p.set_defaults(func=cmd_fixture_compensation)
     sub.add_parser("column-map").set_defaults(func=lambda a: _instrument("column_map", a, "column_map"))
     sub.add_parser("drive").set_defaults(func=lambda a: _instrument("drive_sweep", a, "drive"))
     sub.add_parser("link-cal").set_defaults(func=lambda a: _instrument("link_calibration_test", a, "link_cal"))
@@ -256,6 +292,8 @@ def main():
     p.set_defaults(func=cmd_manual_check)
     p = sub.add_parser("firmware")
     p.add_argument("--flash", action="store_true")
+    p.add_argument("--board", default="revB", choices=("revB", "revC"),
+                   help="board revision to build/flash (default revB)")
     p.set_defaults(func=cmd_firmware)
     sub.add_parser("gui").set_defaults(func=cmd_gui)
     sub.add_parser("tests").set_defaults(func=cmd_tests)

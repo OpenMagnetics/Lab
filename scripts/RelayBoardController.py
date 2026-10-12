@@ -233,11 +233,52 @@ class RelayBoardController:
         self.resource_string = com_port or self._auto_detect()
         self.visa_session = self._connect(self.resource_string)
         self.identity = self.visa_session.query("*IDN?").strip()
+        # Board revision from *IDN? ("OpenMagnetics,RelayBoard,revC,2.0.0"):
+        # rev C has the Kelvin crossbar and its own relay map (RelayMapRevC).
+        fields = self.identity.split(",")
+        self.revision = fields[2].strip() if len(fields) > 2 else "revB"
+        self.relay_count = 24 if self.revision == "revC" else RELAY_COUNT
+        self.kelvin = False
         self.current_config = None
         self.current_path = None
         self.cal_mode = "MEAS"
+        self.board_serial = self.serial()
 
     # ------------------------------------------------------------ transport
+
+    RECONNECT_ATTEMPTS = 15             # x 1 s: re-enumeration takes 1-3 s
+
+    def _reconnect(self):
+        """Reopen the board after a USB drop (an ESD hit or a watchdog reset
+        re-enumerates it: EN 61326-1 criterion B wants recovery without the
+        user). Firmware >= 2.0.0 restores its relay word after a watchdog
+        reset; the caller re-drives the state it wanted regardless. Refuses a
+        different board (serial mismatch)."""
+        import time
+        try:
+            self.visa_session.close()
+        except Exception:
+            pass
+        last_error = None
+        for _ in range(self.RECONNECT_ATTEMPTS):
+            time.sleep(1.0)
+            try:
+                try:
+                    session = self._connect(self.resource_string)
+                except Exception:
+                    self.resource_string = self._auto_detect()   # COM number moved
+                    session = self._connect(self.resource_string)
+            except Exception as error:
+                last_error = error
+                continue
+            self.visa_session = session
+            serial = self.serial()
+            if self.board_serial and serial and serial != self.board_serial:
+                raise RuntimeError(f"Reconnected to a different relay board ({serial}, "
+                                   f"expected {self.board_serial})")
+            print(f"Relay board reconnected at {self.resource_string}")
+            return
+        raise RuntimeError(f"Relay board did not come back after a USB drop: {last_error}")
 
     def _auto_detect(self):
         manager = pyvisa.ResourceManager()
@@ -288,6 +329,35 @@ class RelayBoardController:
         if not error.strip().startswith("0"):
             raise RuntimeError(f"Relay board rejected {text!r}: {error.strip()}")
 
+    # ------------------------------------------------- revision-aware words
+
+    def _measurement_word(self, config):
+        if self.revision == "revC":
+            import RelayMapRevC
+            return RelayMapRevC.measurement_word(config, kelvin=self.kelvin)
+        return measurement_word(config)
+
+    def _calibration_word(self, config, mode):
+        if self.revision == "revC":
+            import RelayMapRevC
+            if mode.upper() == "MEAS":
+                return RelayMapRevC.measurement_word(config, kelvin=self.kelvin)
+            return RelayMapRevC.calibration_word(config, mode, kelvin=self.kelvin)
+        return measurement_word(config) | calibration_overlay(config, mode)
+
+    def set_kelvin(self, enabled):
+        """Rev C only: sense rails to the front-end and CH1 on its output.
+
+        Takes effect immediately on the current state. The Bode CH1 input
+        should be set to 1 Mohm in Kelvin mode (simulate_frontend.py); the
+        calibration names carry a -K suffix so 2-wire and Kelvin OSLs never
+        mix."""
+        if self.revision != "revC":
+            raise RuntimeError(f"Kelvin mode needs a rev C board (this is {self.revision})")
+        self.kelvin = bool(enabled)
+        if self.current_config is not None:
+            self.set_calibration_mode(self.cal_mode)
+
     # ----------------------------------------------------------- switching
 
     def set_config(self, config_number):
@@ -297,7 +367,7 @@ class RelayBoardController:
         # Relays are driven one by one from the table above rather than with
         # CONF:MEAS, so the switching cannot depend on whichever relay table a
         # given firmware build carries (1.1.1 had config 8 wrong).
-        self._apply_word(measurement_word(config))
+        self._apply_word(self._measurement_word(config))
         self.current_config = config_number
         self.current_path = signal_path(config)
         self.cal_mode = "MEAS"
@@ -316,18 +386,24 @@ class RelayBoardController:
         substituting the on-board standard -- so the DUT can stay clamped.
         """
         mode = mode.upper()
-        if mode not in ("MEAS", "OPEN", "SHORT", "LOAD"):
-            raise ValueError(f"Bad calibration mode {mode!r}")
+        allowed = ("MEAS", "OPEN", "SHORT", "LOAD")
+        if self.revision == "revC":
+            allowed += ("CHECK_R1", "CHECK_C10")     # on-board verification standards
+        if mode not in allowed:
+            raise ValueError(f"Bad calibration mode {mode!r} for {self.revision}")
         if self.current_config is None:
             raise RuntimeError("Set a measurement configuration before a calibration mode.")
         config = CONFIGS[self.current_config]
-        self._apply_word(measurement_word(config) | calibration_overlay(config, mode))
+        self._apply_word(self._calibration_word(config, mode))
         self.cal_mode = mode
         return mode
 
     def calibration_name(self, config_number=None):
         """File-safe name of the calibration owned by a configuration."""
         config = CONFIGS[config_number if config_number is not None else self.current_config]
+        if self.revision == "revC":
+            suffix = "-K" if self.kelvin else ""
+            return f"relay_board_revC_{signal_path(config)}{suffix}.mcalx"
         return f"relay_board_{signal_path(config)}.mcalx"
 
     def needs_recalibration(self, config_number):
@@ -336,8 +412,8 @@ class RelayBoardController:
     # ------------------------------------------------------------ low level
 
     def set_relay(self, relay_number, state):
-        if not 0 <= relay_number < RELAY_COUNT:
-            raise ValueError(f"Relay must be 0..{RELAY_COUNT - 1}, got {relay_number}")
+        if not 0 <= relay_number < self.relay_count:
+            raise ValueError(f"Relay must be 0..{self.relay_count - 1}, got {relay_number}")
         self._command(f"RELAY {relay_number} {1 if state else 0}")
 
     def _apply_word(self, word):
@@ -345,18 +421,67 @@ class RelayBoardController:
 
         Relays being released go first so a transition never closes a new
         path while an old one is still made (no momentary HI-LO bridge).
+        A USB drop on the way (pyvisa error) reconnects once and re-drives.
         """
+        try:
+            self._drive_word(word)
+        except pyvisa.errors.VisaIOError:
+            self._reconnect()
+            self._drive_word(word)
+
+    def _drive_word(self, word):
         current = self.get_relay_states()
-        releases = [i for i in range(RELAY_COUNT) if current[i] and not (word >> i) & 1]
-        energizes = [i for i in range(RELAY_COUNT) if not current[i] and (word >> i) & 1]
+        count = self.relay_count
+        releases = [i for i in range(count) if current[i] and not (word >> i) & 1]
+        energizes = [i for i in range(count) if not current[i] and (word >> i) & 1]
         for index in releases:
             self.set_relay(index, 0)
         for index in energizes:
             self.set_relay(index, 1)
         readback = self.get_relay_states()
-        expected = [(word >> i) & 1 for i in range(RELAY_COUNT)]
+        expected = [(word >> i) & 1 for i in range(count)]
         if readback != expected:
             raise RuntimeError(f"Relay board state {readback} does not match requested {expected}")
+
+    # ------------------------------------------------ firmware >= 2.0 extras
+
+    def _optional_query(self, command):
+        """Query that older firmware does not know: None instead of an error
+        (firmware < 2.0.0 is not asked at all: it would never reply)."""
+        try:
+            version = tuple(int(v) for v in self.identity.split(",")[-1].strip().split("."))
+        except ValueError:
+            version = (0,)
+        if version < (2, 0, 0):
+            return None
+        try:
+            reply = self.visa_session.query(command).strip()
+        except Exception:
+            return None
+        error = self.visa_session.query("SYST:ERR?").strip()
+        return None if not error.startswith("0") else reply
+
+    def serial(self):
+        """MCU factory unique ID (24 hex digits): which physical board."""
+        return self._optional_query("SYST:SER?")
+
+    def temperature(self):
+        """Fixture temperature in degC (rev C TMP117), or None."""
+        reply = self._optional_query("MEAS:TEMP?")
+        try:
+            return float(reply)
+        except (TypeError, ValueError):
+            return None
+
+    def relay_counts(self):
+        """Lifetime actuation count per relay (K1 first), or None."""
+        reply = self._optional_query("RELAY:COUNT?")
+        return [int(v) for v in reply.split(",")] if reply else None
+
+    def coil_supply(self):
+        """Rev C coil switch: 1 on, 0 off, -1 overcurrent fault; None if absent."""
+        reply = self._optional_query("SYST:COIL?")
+        return int(reply) if reply not in (None, "") else None
 
     def get_relay_states(self):
         response = self.visa_session.query("RELAY:ALL?").strip()

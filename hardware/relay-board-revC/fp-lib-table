@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "OpenMagnetics")(type "KiCad")(uri "${KIPRJMOD}/OpenMagnetics.pretty")(options "")(descr "Project footprints: Omron G6K-2F-RF-S exact land pattern"))
+)

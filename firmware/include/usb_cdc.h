@@ -10,5 +10,6 @@ typedef void (*usb_cdc_rx_fn)(uint8_t byte);
 void usb_cdc_init(usb_cdc_rx_fn on_byte);
 void usb_cdc_poll(void);
 void usb_cdc_write(const char *data, uint32_t length);
+int usb_cdc_configured(void);          /* host has configured the device */
 
 #endif

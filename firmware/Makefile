@@ -14,17 +14,22 @@
 
 OPENCM3_DIR ?= ../libopencm3
 PREFIX      ?= arm-none-eabi
-BUILD       := build
+#   make BOARD=revC           rev C (Kelvin, 23 relays): include/relay_map_revc.h
+BOARD       ?= revB
+BUILD       := build/$(BOARD)
 TARGET      := $(BUILD)/relay_board
 
 CC      := $(PREFIX)-gcc
 OBJCOPY := $(PREFIX)-objcopy
 SIZE    := $(PREFIX)-size
 
-SOURCES := src/main.c src/scpi.c src/usb_cdc.c
+SOURCES := src/main.c src/scpi.c src/usb_cdc.c src/board_extras.c
 OBJECTS := $(SOURCES:src/%.c=$(BUILD)/%.o)
 
 DEFS    := -DSTM32F0
+ifeq ($(BOARD),revC)
+DEFS    += -DBOARD_REVC
+endif
 ARCH    := -mcpu=cortex-m0 -mthumb -msoft-float
 CFLAGS  := $(ARCH) $(DEFS) -Os -g -std=c11 \
            -Wall -Wextra -Wshadow -Wconversion \
@@ -38,7 +43,7 @@ LDLIBS  := -lopencm3_stm32f0 -lc -lgcc -lnosys
 all: $(TARGET).bin
 	$(SIZE) $(TARGET).elf
 
-$(BUILD)/%.o: src/%.c include/relay_map.h include/scpi.h include/usb_cdc.h | $(BUILD)
+$(BUILD)/%.o: src/%.c include/relay_map.h include/relay_map_revc.h include/scpi.h include/usb_cdc.h include/board_extras.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET).elf: $(OBJECTS)

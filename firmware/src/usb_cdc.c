@@ -185,6 +185,11 @@ static void data_rx(usbd_device *device, uint8_t endpoint)
     }
 }
 
+int usb_cdc_configured(void)
+{
+    return configured;
+}
+
 static void set_configuration(usbd_device *device, uint16_t value)
 {
     (void)value;

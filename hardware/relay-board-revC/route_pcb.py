@@ -1,7 +1,7 @@
 """
-Route the rev B board: freerouting DSN/SES round trip, zone fill, DRC.
+Route the rev C board: freerouting DSN/SES round trip, zone fill, DRC.
 
-    "C:\\Program Files\\KiCad\\9.0\\bin\\python.exe" route_pcb.py
+    "C:\\Program Files\\KiCad\\10.0\\bin\\python.exe" route_pcb.py
 
 Programmatic trace-by-trace routing was abandoned in rev A (see
 ROUTING_GUIDE.md there); the supported path is the Specctra round trip with
@@ -17,52 +17,45 @@ import sys
 
 import pcbnew
 
+import generate_pcb as layout          # geometry + DSN plane-layer patch
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOARD_PATH = os.path.join(HERE, "relay_board.kicad_pcb")
 DSN = os.path.join(HERE, "relay_board.dsn")
 SES = os.path.join(HERE, "relay_board.ses")
 JAR = os.path.join(HERE, "..", "..", "tools", "freerouting-1.9.0.jar")
-KICAD_CLI = r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe"
+KICAD_CLI = r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe"
 
 # freerouting 1.9 needs Java 17+; a portable Adoptium JRE is vendored in
 # tools/ next to the freerouting jar.
-_TOOLS_JAVA = os.path.join(HERE, "..", "..", "tools",
-                           'jdk-17.0.20.1+1-jre', "bin", "java.exe")
+_TOOLS_JAVA = next(iter(sorted(__import__("glob").glob(
+    os.path.join(HERE, "..", "..", "tools", "jdk-*-jre", "bin", "java.exe")))), "")
 JAVA = _TOOLS_JAVA if os.path.exists(_TOOLS_JAVA) else "java"
 
 
 def patch_dsn_power_layers():
-    """Mark In1/In2 as power in the DSN so freerouting never routes there
-    (must run after EVERY ExportSpecctraDSN)."""
-    with open(DSN, encoding="utf-8") as handle:
-        lines = handle.readlines()
-    count = 0
-    pending = None
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if (stripped.startswith("(layer In1.Cu")
-                or stripped.startswith("(layer In2.Cu")):
-            pending = index
-        elif pending is not None and "(type signal)" in line:
-            lines[index] = line.replace("(type signal)", "(type power)")
-            count += 1
-            pending = None
-        elif stripped.startswith("(layer "):
-            pending = None
-    with open(DSN, "w", encoding="utf-8") as handle:
-        handle.writelines(lines)
+    """Mark the plane layers (In1/In3/In4) as power in the DSN so freerouting
+    never routes there (must run after EVERY ExportSpecctraDSN)."""
+    count = layout.patch_dsn_power_layers(DSN)
     if count:
-        print(f"  DSN: {count} inner layers set to power")
+        print(f"  DSN: {count} plane layers set to power")
 
 
-def run_freerouting(passes=24):
+def in_plane_region(x, y):
+    """True where the GND planes (and the strip's +5V plane) exist."""
+    return (layout.BOARD_X0 + 1.0 < x < layout.BOARD_X1 - 1.0
+            and layout.BOARD_Y0 + 1.0 < y < layout.BOARD_Y1 - 1.0
+            and not layout.point_in_polygon(x, y, layout.VOID))
+
+
+def run_freerouting(passes=12):
     if not os.path.exists(DSN):
         raise SystemExit("relay_board.dsn missing -- run generate_pcb.py first")
     print(f"freerouting: {os.path.basename(DSN)} -> {os.path.basename(SES)}")
     command = [JAVA, "-jar", JAR, "-de", DSN, "-do", SES,
-               "-mp", str(passes), "-us", "global"]
+               "-mp", str(passes), "-us", "greedy"]   # global: >30 min on the 6-layer board
     result = subprocess.run(command, capture_output=True, text=True,
-                            cwd=HERE, timeout=1800)
+                            cwd=HERE, timeout=7200)
     tail = (result.stdout or "").strip().splitlines()[-8:]
     for line in tail:
         print("   ", line)
@@ -84,7 +77,7 @@ def plane_fanout(board):
     arriving (a locked feed), drop a stub + via at the first collision-free
     candidate offset.
     """
-    plane_nets = {"/GND": "/GND", "/+5V": "/+5V"}
+    plane_nets = {"/GND": "/GND"}         # +5V is routed in rev C
     obstacles = []
     for track in board.GetTracks():
         obstacles.append(track)
@@ -120,8 +113,8 @@ def plane_fanout(board):
                 continue            # through-hole pads reach the planes
             position = pad.GetPosition()
             px, py = pcbnew.ToMM(position.x), pcbnew.ToMM(position.y)
-            if px < 150.0 and net_name == "/+5V":
-                continue            # signal region +5V is pre-routed
+            if net_name == "/+5V" and px < layout.STRIP_X0:
+                continue            # relay coils: pre-routed In3 tree
             already = any(t.GetNetCode() == pad.GetNetCode()
                           and t.GetClass() == "PCB_VIA"
                           and abs(pcbnew.ToMM(t.GetPosition().x) - px) < 2.2
@@ -132,8 +125,10 @@ def plane_fanout(board):
             placed = False
             for dx, dy in candidates:
                 x, y = px + dx, py + dy
-                if not (152.3 < x < 188.5 and 41.5 < y < 128.5):
+                if not in_plane_region(x, y):
                     continue        # via must land inside the plane region
+                if net_name == "/+5V" and x < layout.STRIP_X0 + 0.5:
+                    continue        # +5V plane only in the control strip
                 if any(collides(px + dx * f, py + dy * f, pad.GetNetCode())
                        for f in (0.4, 0.7, 1.0)):
                     continue
@@ -209,6 +204,68 @@ def repair_locked_clearance(board, margin_mm=0.0):
     return culled_nets
 
 
+def return_path_stitching(board, reach=1.5):
+    """A GND via within `reach` of every signal via outside the measurement
+    void. A signal moving F.Cu <-> B.Cu changes reference plane (In1 <-> In2);
+    its return current crosses between the planes at the nearest GND via, so
+    that via must be right there or the return loop opens up (Faraday's
+    return-path rule; Ott ch. 16)."""
+    gnd = board.FindNet("/GND").GetNetCode()
+    vias = [t for t in board.GetTracks() if t.GetClass() == "PCB_VIA"]
+    gnd_xy = [(pcbnew.ToMM(v.GetPosition().x), pcbnew.ToMM(v.GetPosition().y))
+              for v in vias if v.GetNetCode() == gnd]
+    for footprint in board.GetFootprints():          # THT GND pads count too
+        for pad in footprint.Pads():
+            if pad.GetNetCode() == gnd and pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
+                gnd_xy.append((pcbnew.ToMM(pad.GetPosition().x), pcbnew.ToMM(pad.GetPosition().y)))
+    pads = [pad for fp in board.GetFootprints() for pad in fp.Pads()]
+
+    def spot_free(x, y):
+        position = pcbnew.VECTOR2I(mm(x), mm(y))
+        for item in board.GetTracks():
+            if item.GetClass() == "PCB_VIA":
+                q = item.GetPosition()
+                if ((pcbnew.ToMM(q.x) - x) ** 2 + (pcbnew.ToMM(q.y) - y) ** 2) ** 0.5 < 0.85:
+                    return False
+            if item.GetNetCode() != gnd and item.HitTest(position, mm(0.55)):
+                return False
+        for pad in pads:
+            if pad.GetNetCode() != gnd and pad.HitTest(position, mm(0.55)):
+                return False
+        return True
+
+    added, missing = 0, 0
+    for via in vias:
+        if via.GetNetCode() == gnd:
+            continue
+        x, y = pcbnew.ToMM(via.GetPosition().x), pcbnew.ToMM(via.GetPosition().y)
+        if layout.point_in_polygon(x, y, layout.VOID):
+            continue                                  # no planes there
+        if any((gx - x) ** 2 + (gy - y) ** 2 < reach ** 2 for gx, gy in gnd_xy):
+            continue
+        for radius in (0.9, 1.2, 1.5):
+            spots = [(x + radius * __import__("math").cos(a), y + radius * __import__("math").sin(a))
+                     for a in [k * 3.14159265 / 6 for k in range(12)]]
+            spot = next(((sx, sy) for sx, sy in spots
+                         if not layout.point_in_polygon(sx, sy, layout.VOID) and spot_free(sx, sy)), None)
+            if spot:
+                stitch = pcbnew.PCB_VIA(board)
+                stitch.SetPosition(pcbnew.VECTOR2I(mm(spot[0]), mm(spot[1])))
+                stitch.SetDrill(mm(0.3))
+                stitch.SetWidth(mm(0.6))
+                stitch.SetNetCode(gnd)
+                stitch.SetViaType(pcbnew.VIATYPE_THROUGH)
+                stitch.SetLocked(True)
+                board.Add(stitch)
+                gnd_xy.append(spot)
+                added += 1
+                break
+        else:
+            missing += 1
+    print(f"return-path stitching: {added} GND vias added"
+          + (f", {missing} signal vias without room" if missing else ""))
+
+
 def sweep_dangling(board):
     """Iteratively remove unlocked track segments with a floating end
     (geometric test: nothing else touches the endpoint)."""
@@ -262,7 +319,7 @@ def import_session():
     # purge unlocked inner-layer tracks: only locked pre-routes belong on
     # the planes (freerouting briefly routed there while the DSN power-type
     # patch was broken, and that junk otherwise survives every import)
-    inner = (pcbnew.In1_Cu, pcbnew.In2_Cu)
+    inner = (pcbnew.In1_Cu, pcbnew.In2_Cu)          # the plane layers
     junk = [t for t in board.GetTracks()
             if not t.IsLocked() and t.GetClass() != "PCB_VIA"
             and t.GetLayer() in inner]
@@ -273,6 +330,7 @@ def import_session():
     culled = repair_locked_clearance(board)
     sweep_dangling(board)
     plane_fanout(board)
+    return_path_stitching(board)
     filler = pcbnew.ZONE_FILLER(board)
     filler.Fill(board.Zones())
     board.Save(BOARD_PATH)
@@ -299,7 +357,24 @@ def run_drc():
     return counts
 
 
+def finish_without_autorouter():
+    """Everything is maze-routed (maze_route.py, coarse + --fine): no
+    freerouting. Clean up, fan GND out, stitch return paths, fill, DRC."""
+    board = pcbnew.LoadBoard(BOARD_PATH)
+    sweep_dangling(board)
+    plane_fanout(board)
+    return_path_stitching(board)
+    pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+    board.Save(BOARD_PATH)
+    print("zones filled, board saved")
+    counts = run_drc()
+    sys.exit(1 if counts.get("unconnected_items") or counts.get("clearance")
+             or counts.get("shorting_items") or counts.get("tracks_crossing") else 0)
+
+
 if __name__ == "__main__":
+    if "--no-freerouting" in sys.argv:
+        finish_without_autorouter()
     if "--skip-route" not in sys.argv:
         run_freerouting()
     board, culled = import_session()
@@ -311,7 +386,7 @@ if __name__ == "__main__":
         board = pcbnew.LoadBoard(BOARD_PATH)
         pcbnew.ExportSpecctraDSN(board, DSN)
         patch_dsn_power_layers()
-        run_freerouting(passes=30)   # different depth -> different landscape
+        run_freerouting(passes=16)   # different depth -> different landscape
         board, culled = import_session()
         if culled:
             print(f"WARNING: nets still conflicting after repair: {culled}")
@@ -323,7 +398,7 @@ if __name__ == "__main__":
         board = pcbnew.LoadBoard(BOARD_PATH)
         pcbnew.ExportSpecctraDSN(board, DSN)
         patch_dsn_power_layers()
-        run_freerouting(passes=28 + 6 * extra_round)
+        run_freerouting(passes=12 + 4 * extra_round)
         import_session()
         counts = run_drc()
     sys.exit(1 if counts.get("unconnected_items") or counts.get("clearance")

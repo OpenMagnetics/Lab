@@ -1,0 +1,10 @@
+(version 1)
+(rule usb_field_fine_pitch
+  (condition "A.intersectsArea('usb_field') && B.intersectsArea('usb_field')")
+  (constraint clearance (min 0.12mm))
+  (constraint track_width (min 0.12mm)))
+(rule mcu_corner_decoupler
+  # C8 sits in U1's NE corner notch (decouples VDD 48 and VBAT 1), clear of
+  # every pin but inside the LQFP's rectangular courtyard
+  (condition "A.Reference == 'C8' && B.Reference == 'U1'")
+  (constraint courtyard_clearance (min -2mm)))

@@ -1,6 +1,6 @@
 # Rev D — future ideas
 
-Long-horizon items, deliberately kept out of rev B2. Nothing here is
+Long-horizon items, deliberately kept out of rev C. Nothing here is
 scheduled.
 
 ## Automated gap change: saturable insert

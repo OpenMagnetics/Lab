@@ -26,6 +26,7 @@ import pandas
 
 import Bode100Analyzer
 import CapacitanceFit as cfit
+import FixtureCompensation as fc
 import RelayBoardController as rbc
 import TransformerModel as tm
 
@@ -60,9 +61,12 @@ class MagneticCharacterizer:
     DRIVE_HIGH_BAND_DBM = 13
 
     def __init__(self, reference="temp", relay_board_port=None, bode_ip=None,
-                 auto_calibrate=True, offline=False):
+                 auto_calibrate=True, offline=False, kelvin=False):
         self.reference = reference
         self.auto_calibrate = auto_calibrate
+        #: rev C Kelvin mode: sense rails to the front-end, CH1 on its output;
+        #: own calibrations (-K) and cache files (_K)
+        self.kelvin = kelvin
 
         here = pathlib.Path(__file__).parent.resolve()
         self.calibrations_path = here / "calibrations"
@@ -82,6 +86,7 @@ class MagneticCharacterizer:
 
         if offline:
             self.offline = True
+            self.compensation = fc.Store(self.calibrations_path, None)
             print("*** OFFLINE by request -- cached CSVs only, nothing is measured.\n")
             return
         try:
@@ -89,10 +94,14 @@ class MagneticCharacterizer:
             self.bode_100 = Bode100Analyzer.MagneticMeasurer(**kwargs)
             self.relay_board = rbc.RelayBoardController(com_port=relay_board_port)
             self.relay_board.reset()
+            if kelvin:
+                self.relay_board.set_kelvin(True)
         except Exception as error:
             self.offline = True
             print(f"\n*** No instruments ({type(error).__name__}: {error})")
             print("*** Running OFFLINE -- cached CSVs only, allow_use_cache must be True.\n")
+        self.compensation = fc.Store(self.calibrations_path,
+                                     self.relay_board.identity if self.relay_board else None)
 
     # ------------------------------------------------------------ warnings
 
@@ -104,7 +113,57 @@ class MagneticCharacterizer:
 
     def _cache_path(self, config_number, kind, drive_dbm=None):
         name = rbc.CONFIGS[config_number]["name"]
-        return self.output_path / f"{self.reference}_cfg{config_number:02d}_{name}_{kind}.csv"
+        suffix = "_K" if self.kelvin else ""
+        return self.output_path / f"{self.reference}_cfg{config_number:02d}_{name}_{kind}{suffix}.csv"
+
+    # ------------------------------------------- clamp-plane compensation
+
+    def _compensation_key(self, config_number):
+        return rbc.signal_path(rbc.CONFIGS[config_number]) + ("-K" if self.kelvin else "")
+
+    def _compensated(self, data, config_number):
+        """Apply the stored clamp-plane open/short compensation, if any."""
+        store = getattr(self, "compensation", None)
+        entry = store.entry(self._compensation_key(config_number)) if store else None
+        if entry is None or not ({"magnitude", "inductance"} & set(data.columns)):
+            return data
+        if not ("open_re" in entry and "short_re" in entry):
+            return data
+        return fc.apply(data, entry)
+
+    def characterize_fixture_compensation(self, short_bar_h=0.0, states=("open", "short")):
+        """One-time clamp-plane OPEN / SHORT, per signal path (operator steps).
+
+        OPEN: nothing in the clamps. SHORT: a shorting bar (or a dummy header
+        with shorting links) across all four clamps, force and sense
+        positions. Each path is measured through its own automatic OSL, so
+        the stored residuals are exactly what that OSL leaves. ``short_bar_h``
+        declares the bar's own inductance (Keysight: define the short bar's
+        inductance), which is then not subtracted from the DUT.
+        """
+        if self.offline:
+            raise RuntimeError("fixture compensation needs the instruments")
+        paths = {}
+        for number, config in sorted(rbc.CONFIGS.items()):
+            if config["HI"] and config["LO"]:
+                paths.setdefault(self._compensation_key(number), number)
+        prompts = {"open": "Remove the DUT: NOTHING in the clamps.",
+                   "short": "Fit the shorting bar across all four clamps (A, B, C, D; force and sense)."}
+        for state in states:
+            input(f"\n{prompts[state]}  Press Enter to measure {len(paths)} paths...")
+            for key, number in paths.items():
+                self._set_config(number)
+                data = self.bode_100.take_Z_phase_measurement(
+                    start_frequency=fc.BAND[0], stop_frequency=fc.BAND[1],
+                    number_of_measurement_cycles=2, number_of_measurement_points=fc.POINTS,
+                    source_power_dbm=self.DRIVE_HIGH_BAND_DBM)
+                f, z = fc.complex_z(tm.average_cycles(data))
+                self.compensation.put(key, state, f, z, short_bar_h)
+                index = int(numpy.argmin(abs(f - 1e5)))
+                print(f"  {state:5s} {key:12s} |Z|(100 kHz) = {abs(z[index]):.4g} ohm")
+        self.relay_board.reset()
+        print(f"stored {self.compensation.save()}")
+        return self.compensation.data
 
     def _set_config(self, config_number):
         """Switch, then make sure the calibration matches THIS relay state.
@@ -139,12 +198,25 @@ class MagneticCharacterizer:
 
     def _calibration_provenance(self):
         """What a stored calibration is only valid for."""
-        return {
+        provenance = {
             "relay_board": self.relay_board.identity,
             "bode_100": self.bode_100.visa_session.query("*IDN?").strip(),
             "source_power_dbm": self.bode_100.source_power,
             "load_ohm": rbc.CALIBRATION_LOAD_OHM,
         }
+        serial = getattr(self.relay_board, "serial", lambda: None)()
+        if serial:
+            provenance["relay_board_serial"] = serial
+        return provenance
+
+    #: A calibration taken more than this far from the current fixture
+    #: temperature is re-acquired (rev C TMP117): R5 25 ppm/K and the relay
+    #: contacts drift with temperature well before 24 h are up.
+    MAX_CALIBRATION_DELTA_C = 2.0
+
+    def _fixture_temperature(self):
+        reader = getattr(self.relay_board, "temperature", None)
+        return reader() if reader else None
 
     def _calibration_is_current(self, calibration_file):
         """A .mcalx is reused only with a sidecar that matches this setup.
@@ -170,6 +242,12 @@ class MagneticCharacterizer:
                 print(f"  Calibration {os.path.basename(calibration_file)} was taken with "
                       f"{key}={metadata.get(key)!r}, now {value!r}; re-acquiring")
                 return False
+        now = self._fixture_temperature()
+        then = metadata.get("fixture_temperature_c")
+        if now is not None and then is not None and abs(now - then) > self.MAX_CALIBRATION_DELTA_C:
+            print(f"  Calibration {os.path.basename(calibration_file)} was taken at {then:.1f} C, "
+                  f"fixture now {now:.1f} C; re-acquiring")
+            return False
         return True
 
     def _standard_magnitude(self, mode):
@@ -200,6 +278,37 @@ class MagneticCharacterizer:
                                + "; ".join(problems))
         print("    standards OK: " + ", ".join(f"{m} {v:.3g} ohm" for m, v in readings.items()))
         return readings
+
+    #: rev C check standards: nominal value, tolerance (2-wire, Kelvin).
+    #: 2-wire is loose: the 1R is read through a different select relay than
+    #: the LOAD, whose contact resistance (~50 mohm) is outside the OSL.
+    CHECK_STANDARDS = {"CHECK_R1": ("resistance", 1.0, 0.15, 0.01),
+                       "CHECK_C10": ("capacitance", 10e-12, 0.10, 0.10)}
+
+    def _verify_check_standards(self, path):
+        """Rev C: read the 1R and 10 pF standards through the fresh OSL."""
+        if getattr(self.relay_board, "revision", "revB") != "revC":
+            return None
+        results = {}
+        for mode, (quantity, nominal, tol_2w, tol_k) in self.CHECK_STANDARDS.items():
+            self.relay_board.set_calibration_mode(mode)
+            band = (1e4, 1e5) if quantity == "resistance" else (1e5, 1e6)
+            data = tm.average_cycles(self.bode_100.take_Z_phase_measurement(
+                start_frequency=band[0], stop_frequency=band[1], number_of_measurement_cycles=2,
+                number_of_measurement_points=11, source_power_dbm=self.bode_100.source_power))
+            f, z = fc.complex_z(data)
+            value = float(numpy.median(z.real)) if quantity == "resistance" else \
+                float(numpy.median(-1 / (2 * numpy.pi * f * z.imag)))
+            tolerance = tol_k if self.kelvin else tol_2w
+            ok = abs(value - nominal) <= tolerance * nominal
+            results[mode] = {"value": value, "nominal": nominal, "tolerance": tolerance, "pass": ok}
+            unit = "ohm" if quantity == "resistance" else "F"
+            print(f"    {mode}: {value:.4g} {unit} (nominal {nominal:g}, +/-{tolerance:.0%}) "
+                  f"{'OK' if ok else 'FAIL'}")
+            if not ok:
+                self.warn(f"{mode} on path {path} reads {value:.4g} {unit}, outside +/-{tolerance:.0%}")
+        self.relay_board.set_calibration_mode("OPEN")
+        return results
 
     def _ensure_calibrated(self, config_number):
         calibration_file = str(self.calibrations_path / self.relay_board.calibration_name(config_number))
@@ -259,6 +368,7 @@ class MagneticCharacterizer:
             self.relay_board.set_calibration_mode("OPEN")
             short_residual = self._standard_magnitude("SHORT")
             print(f"    SHORT after re-actuation: {short_residual*1e3:.1f} mohm")
+            checks = self._verify_check_standards(path)
         finally:
             try:
                 self.relay_board.set_calibration_mode("MEAS")
@@ -271,7 +381,9 @@ class MagneticCharacterizer:
                         signal_path=path,
                         standards_raw_ohm=standards,
                         standards_checked="before_osl" if check_before_osl else "through_fresh_osl",
-                        short_residual_ohm=short_residual)
+                        short_residual_ohm=short_residual,
+                        check_standards=checks,
+                        fixture_temperature_c=self._fixture_temperature())
         self._calibration_metadata_path(calibration_file).write_text(json.dumps(metadata, indent=2))
         self.bode_100.current_calibration_group = path
         self.bode_100.current_calibration_file = calibration_file
@@ -297,7 +409,7 @@ class MagneticCharacterizer:
             file_kind = f"RL_{drive_dbm:+d}dBm"
         path = self._cache_path(config_number, file_kind)
         if allow_use_cache and path.exists():
-            return pandas.read_csv(path)
+            return self._compensated(pandas.read_csv(path), config_number)
         if self.offline:
             raise RuntimeError(
                 f"Offline and no cached sweep at {path.name}. Connect the "
@@ -310,7 +422,7 @@ class MagneticCharacterizer:
         # one and gave slightly different results (eta 1.0032 vs 1.0037).
         key = (config_number, kind, start, stop, cycles, points, drive_dbm)
         if key in self._session_sweeps:
-            return self._session_sweeps[key]
+            return self._compensated(self._session_sweeps[key], config_number)
 
         self._verify_dut_identity()
         self._set_config(config_number)
@@ -319,7 +431,7 @@ class MagneticCharacterizer:
                 start, stop, cycles, self.CAPACITANCE_SWEEP["points_per_decade"], drive_dbm)
             data.to_csv(path, index=False)
             self._session_sweeps[key] = data
-            return data
+            return self._compensated(data, config_number)
         method = {"RL": self.bode_100.take_Rs_Ls_measurement,
                   "Z": self.bode_100.take_Z_phase_measurement,
                   "Zhd": self.bode_100.take_Z_phase_measurement,
@@ -330,7 +442,7 @@ class MagneticCharacterizer:
                       source_power_dbm=drive_dbm)
         data.to_csv(path, index=False)
         self._session_sweeps[key] = data
-        return data
+        return self._compensated(data, config_number)
 
     #: A clamped DUT is accepted as the reference's DUT when its open-circuit
     #: |Z| matches the cached one this closely (median over the probe sweep).
@@ -464,6 +576,9 @@ class MagneticCharacterizer:
         corrections = {2: ("AB", "CD"), 4: ("CD", "AB")}     # (driven pair, shorted pair)
         if not paths or config_number not in corrections:
             return 0.0, 0.0
+        store = getattr(self, "compensation", None)
+        if store and store.entry(self._compensation_key(config_number)):
+            return 0.0, 0.0     # the clamp-plane compensation already includes it
         driven, shorted = corrections[config_number]
         L = paths[driven]["other_column"]["L_h"] + paths[shorted]["link_loop"]["L_h"]
         R = paths[driven]["other_column"]["R_ohm"] + paths[shorted]["link_loop"]["R_ohm"]
@@ -512,7 +627,7 @@ class MagneticCharacterizer:
             # A relay in the wrong state swaps an open for a short: orders of
             # magnitude, not percent. A few percent, smooth in frequency, is
             # the link path that shorts the far winding: it sits outside the
-            # OSL plane and differs between the two directions (rev B2 TODO
+            # OSL plane and differs between the two directions (rev C TODO
             # "make the SHORT follow the DUT path"; ~26-59 nH on rev B).
             self.warn(f"Reciprocity off by {worst*100:.1f}% (<= {self.RECIPROCITY_MAX_HZ/1e6:g} MHz): "
                       "switching is correct; this is the uncalibrated link-path impedance in the "
@@ -1006,6 +1121,12 @@ def main():
                         help="also run the multi-gap AC resistance recipe (needs manual re-gapping)")
     parser.add_argument("--gaps", nargs="*", default=None, help="gap labels for --ac-resistance")
     parser.add_argument("--no-auto-calibrate", action="store_true")
+    parser.add_argument("--kelvin", action="store_true",
+                        help="rev C: 4-wire (Kelvin) measurement through the front-end")
+    parser.add_argument("--fixture-compensation", action="store_true",
+                        help="one-time clamp-plane OPEN/SHORT per path (operator steps), then exit")
+    parser.add_argument("--short-bar-nh", type=float, default=0.0,
+                        help="declared inductance of the shorting bar, nH")
     parser.add_argument("--offline", action="store_true",
                         help="never connect to the instruments; replay cached sweeps only")
     parser.add_argument("--describe", default=None,
@@ -1023,7 +1144,10 @@ def main():
     characterizer = MagneticCharacterizer(
         reference=arguments.reference, relay_board_port=arguments.port,
         bode_ip=arguments.bode_ip, auto_calibrate=not arguments.no_auto_calibrate,
-        offline=arguments.offline)
+        offline=arguments.offline, kelvin=arguments.kelvin)
+    if arguments.fixture_compensation:
+        characterizer.characterize_fixture_compensation(short_bar_h=arguments.short_bar_nh * 1e-9)
+        return
     characterizer.characterize_all(allow_use_cache=arguments.cache or arguments.offline,
                                    skip_ac_resistance=not arguments.ac_resistance)
     if arguments.ac_resistance and arguments.gaps:

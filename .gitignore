@@ -19,3 +19,8 @@ scripts/output/
 # Local Claude Code settings
 .claude/
 firmware/build/
+
+# rev C routing intermediates (regenerated)
+hardware/relay-board-revC/relay_board_preopt.kicad_pcb
+hardware/relay-board-revC/relay_board_faraday_input.kicad_pcb
+hardware/relay-board-revC/relay_board.ses

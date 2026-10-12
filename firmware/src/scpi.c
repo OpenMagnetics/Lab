@@ -13,8 +13,18 @@
  *   CONF:MEAS?            -> current configuration (0 = none)
  *   CAL:MODE MEAS|OPEN|SHORT|LOAD
  *   CAL:MODE?             -> current mode
- *   RELAY <0..17>,<0|1>   manual override of one relay (leaves config = 0)
- *   RELAY:ALL?            -> 18 comma-separated coil states, K1 first
+ *   CONF:KELV 0|1         rev C: Kelvin mode (sense to the front-end, CH1
+ *                         on the front-end); applies to MEAS and CAL words
+ *   CONF:KELV?            -> 0|1
+ *   RELAY <0..N-1>,<0|1>  manual override of one relay (leaves config = 0);
+ *                         refused beyond MAX_ENERGIZED coils (USB budget)
+ *   RELAY:ALL?            -> N comma-separated coil states, K1 first
+ *   SYST:SER?             -> 24 hex digits: the MCU's factory unique ID
+ *   RELAY:COUNT?          -> N comma-separated actuation counts, K1 first
+ *   RELAY:COUNT:SAVE      persist the counters now (also every 256 events
+ *                         and before SYST:DFU)
+ *   MEAS:TEMP?            rev C: fixture temperature, degC (TMP117)
+ *   SYST:COIL?            rev C: coil supply 1 on, 0 off, -1 overcurrent
  *   SYST:ERR?             -> oldest queued error, "0,\"No error\"" when empty
  *   SYST:DFU              release all relays, detach USB and reboot into the
  *                         ROM DFU bootloader (no reply; firmware update)
@@ -25,9 +35,10 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "board_extras.h"
 #include "scpi.h"
 
-#define VERSION "1.2.0"
+#define VERSION "2.0.0"
 #define LINE_MAX 96
 #define ERROR_QUEUE 8
 
@@ -123,7 +134,7 @@ static void execute(const char *command)
     }
 
     if (starts(command, "*IDN?")) {
-        reply("OpenMagnetics,RelayBoard,revB," VERSION);
+        reply("OpenMagnetics,RelayBoard," BOARD_NAME "," VERSION);
     } else if (starts(command, "*RST")) {
         push_error(scpi_action_reset());
     } else if (starts(command, "*OPC?")) {
@@ -132,6 +143,18 @@ static void execute(const char *command)
         int result = scpi_action_self_test();
         reply_number(result);
         push_error(result);
+#ifdef BOARD_REVC
+    } else if (starts(command, "CONF:KELV?")) {
+        reply_number((int32_t)scpi_query_kelvin());
+    } else if (starts(command, "CONF:KELV")) {
+        const char *cursor = command + 9;
+        uint32_t state;
+        if (parse_number(&cursor, &state) && state <= 1u) {
+            push_error(scpi_action_set_kelvin(state));
+        } else {
+            push_error(SCPI_ERR_DATA_OUT_OF_RANGE);
+        }
+#endif
     } else if (starts(command, "CONF:MEAS?")) {
         reply_number((int32_t)scpi_query_config());
     } else if (starts(command, "CONF:MEAS")) {
@@ -158,6 +181,63 @@ static void execute(const char *command)
         } else {
             push_error(SCPI_ERR_DATA_OUT_OF_RANGE);
         }
+    } else if (starts(command, "SYST:SER?")) {
+        char serial[25];
+        board_serial(serial);
+        reply(serial);
+    } else if (starts(command, "RELAY:COUNT:SAVE")) {
+        counters_save();
+    } else if (starts(command, "RELAY:COUNT?")) {
+        static char buffer[RELAY_COUNT * 11u + 1u];
+        char *cursor = buffer;
+        for (uint32_t index = 0; index < RELAY_COUNT; index++) {
+            char digits[11];
+            uint32_t value = counters_get(index);
+            int length = 0;
+            do {
+                digits[length++] = (char)('0' + value % 10u);
+                value /= 10u;
+            } while (value);
+            while (length) {
+                *cursor++ = digits[--length];
+            }
+            *cursor++ = (index + 1u < RELAY_COUNT) ? ',' : '\0';
+        }
+        reply(buffer);
+#ifdef BOARD_REVC
+    } else if (starts(command, "MEAS:TEMP?")) {
+        int32_t milli = temperature_millicelsius();
+        if (milli == INT32_MIN) {
+            push_error(SCPI_ERR_SELF_TEST);
+            reply("NaN");
+        } else {
+            char buffer[16];
+            char *cursor = buffer;
+            uint32_t magnitude = (uint32_t)(milli < 0 ? -milli : milli);
+            if (milli < 0) {
+                *cursor++ = '-';
+            }
+            char digits[10];
+            int length = 0;
+            uint32_t whole = magnitude / 1000u;
+            do {
+                digits[length++] = (char)('0' + whole % 10u);
+                whole /= 10u;
+            } while (whole);
+            while (length) {
+                *cursor++ = digits[--length];
+            }
+            uint32_t fraction = magnitude % 1000u;
+            *cursor++ = '.';
+            *cursor++ = (char)('0' + fraction / 100u);
+            *cursor++ = (char)('0' + (fraction / 10u) % 10u);
+            *cursor++ = (char)('0' + fraction % 10u);
+            *cursor = '\0';
+            reply(buffer);
+        }
+    } else if (starts(command, "SYST:COIL?")) {
+        reply_number(coil_supply_state());
+#endif
     } else if (starts(command, "RELAY:ALL?")) {
         char buffer[RELAY_COUNT * 2];
         uint32_t word = scpi_query_relay_word();

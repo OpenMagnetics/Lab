@@ -10,7 +10,7 @@ An automated magnetics characterization lab. Three coupled parts:
 - `hardware/relay-board-revB/` — the current KiCad 9 board: 18-relay switching matrix, STM32F072 USB/SCPI controller, and an **integrated B-WIC measurement bridge** (three BNCs straight to the Bode 100 — no external adapter). Generated programmatically by Python, routed by freerouting with locked pre-routes.
 - `firmware/` — STM32F072 firmware (libopencm3, USB CDC-ACM, SCPI parser). Crystal-less USB via HSI48 + CRS.
 
-`hardware/relay-board-revB2/` is a work-in-progress respin of revB (USB-C moved to the right edge, D+/D- swapped on the USBLC6, relaxed driver band, extra `cleanup_dangling.py` post-route sweep). `hardware/B-WIC-Adapter/` is the abandoned rev A (kept for reference; its DRC never closed, the relay COM/NC pins were swapped, and its scripts hardcode another user's paths).
+`hardware/relay-board-revC/` is the next board (KiCad 10, 4 layers, JLC04161H-7628 stackup written into the board file), a redesign answering an external review: Kelvin force/sense through every relay (pole 1 force, pole 2 sense), direct link relays, a standards column (100R LOAD, 1R and 10 pF check standards), a Kelvin op-amp front-end switched onto CH1, end-fed rails, unified ground with all cables on the bottom edge. `ARCHITECTURE.md` there is the design intent (incl. why the SHORT relays were dropped); `EMC_COMPLIANCE.md` the EU EMC plan (EN 61326-1); `TODO.md` the open items; `FARADAY_FEEDBACK.md` notes on the EMC review tool. `hardware/B-WIC-Adapter/` is the abandoned rev A (kept for reference; its DRC never closed, the relay COM/NC pins were swapped, and its scripts hardcode another user's paths).
 
 ## Commands
 
@@ -110,6 +110,20 @@ Every measurement, check, model and report is reproducible from `python scripts/
 ### Cache and offline mode
 
 Raw sweeps go to `scripts/output/{reference}_cfg{NN}_{configname}_{RL|Z|Cs}.csv` (plus `{reference}_acr_{label}_RL.csv`, `{reference}_ac_resistance.csv`, `{reference}_results.json`); `allow_use_cache=True` / `--cache` reads an existing CSV instead of re-measuring. Always use the cache when working on math/plotting rather than measurement. If either instrument fails to connect, the constructor silently sets `self.offline = True` and only cached data works.
+
+### Rev C flow (KiCad 10 interpreter for pcbnew scripts)
+
+`generate_schematic.py` (ERC) -> `verify_board.py` (simulates every config in 2-wire and Kelvin
+mode plus OPEN/SHORT/LOAD/CHECK using `scripts/RelayMapRevC.py`) -> `generate_firmware_map.py`
+(writes `firmware/include/relay_map_revc.h`; build with `make BOARD=revC`) -> `generate_pcb.py`
+(placement, locked arms/rails/feeds/+5V coil tree, GND fanout, guard strips, stitching) ->
+`maze_route.py` (deterministic A* routing of the measurement nets, supplies and coil returns, locked; measurement nets outer layers only, inner layers inside the void only for the +5V coil feed/returns, crosstalk-weighted cost against coil/supply/digital copper incl. broadside across the 0.21 mm prepreg) -> `route_pcb.py` -> `optimize_tracks.py` (pulls every outer-layer chain taut with exact clearance checks, drops redundant vias; skips rails/GND/USB; keeps the result only if DRC is no worse) -> `parasitic_report.py` (Kelvin arm budgets, equal HI+LO rail length per column)
+-> `faraday_review.py` (OpenConverters Faraday EMC review; needs a KiCad-9-shaped copy, which it
+writes). Analyses: `simulate_frontend.py` (Kelvin front-end), `simulate_calibration.py` and
+`kelvin_coupling.py` (SHORT-standard residuals). The driver picks the relay map from `*IDN?`
+(`revC`); calibration adds post-OSL check standards and clamp-plane fixture compensation
+(`scripts/FixtureCompensation.py`, `bench.py fixture-compensation`). Keep `RelayMapRevC.py`,
+`verify_board.py`, `generate_firmware_map.py` and the schematic in step.
 
 ### Hardware generation flow (rev B)
 

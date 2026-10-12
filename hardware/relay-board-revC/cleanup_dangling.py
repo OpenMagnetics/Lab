@@ -2,7 +2,7 @@
 them, iterating until the report is clean or no progress is made. Runs
 after route_pcb.py:
 
-    "C:\\Program Files\\KiCad\\9.0\\bin\\python.exe" cleanup_dangling.py
+    "C:\\Program Files\\KiCad\\10.0\\bin\\python.exe" cleanup_dangling.py
 
 Deletes unlocked dangling tracks and any dangling via (a locked landing
 via that freerouting ignored is redundant copper on the finished board).
@@ -17,7 +17,7 @@ import pcbnew
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOARD = os.path.join(HERE, "relay_board.kicad_pcb")
-KICAD_CLI = r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe"
+KICAD_CLI = r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe"
 REPORT = os.path.join(HERE, "logs", "cleanup_drc.rpt")
 os.makedirs(os.path.dirname(REPORT), exist_ok=True)
 

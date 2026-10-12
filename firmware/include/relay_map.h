@@ -22,7 +22,13 @@
 
 #include <stdint.h>
 
+#ifdef BOARD_REVC
+#include "relay_map_revc.h"       /* generated: Kelvin crossbar, 24 relays */
+#else
+
+#define BOARD_NAME "revB"
 #define RELAY_COUNT 18u
+#define MAX_ENERGIZED RELAY_COUNT
 
 /* Crossbar bit for terminal t (0=A..3=D) and rail r (0=HI,1=LO,2=LINK). */
 #define MATRIX_BIT(t, r)   ((uint32_t)((t) * 3u + (r)))
@@ -96,4 +102,5 @@ typedef enum {
     CAL_MODE_LOAD,       /* + MASK_ISOLATION + MASK_LOAD                      */
 } cal_mode_t;
 
+#endif /* BOARD_REVC */
 #endif /* RELAY_MAP_H */

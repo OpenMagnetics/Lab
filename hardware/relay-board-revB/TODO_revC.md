@@ -1,10 +1,10 @@
-# Rev B2 TODO
+# Rev C TODO
 
 Open items collected from the rev B review (external review by N. Rosano,
 2026-10, plus a calibration/AC-resistance code audit). Rev B ships as is;
-these are for the B2 respin and the software that drives it.
+these are for the rev C respin and the software that drives it.
 
-## Hardware (B2 board)
+## Hardware (rev C board)
 
 - [ ] **Kelvin (4-wire) path to the DUT for winding resistance / Rac.**
   Rev B is two-terminal: iso contact + arm + clamp (~100 mΩ + 13 nH per
@@ -44,11 +44,11 @@ these are for the B2 respin and the software that drives it.
   Current is sensed only in the LO rail; a stray to board GND at relative potential v adds Cg*v*(v-1).
   The LINK net (rail + two columns) has ~14 pF to GND and sits at v = 1/2 in Lcum/Ldif -> -Cg/4.
   Same 14-15 pF on both DUTs. Configs 17-19 therefore measure LO-rail coupling, not ground capacitance.
-  B2: keep the LINK rail/columns away from the GND plane or guard them.
+  rev C: keep the LINK rail/columns away from the GND plane or guard them.
 - [x] **Reciprocity 7.5 % explained and corrected.** Board-only paths (DUT isolated) differ between A-B
   and C-D: other column -39/+37 nH, LINK loop +39/+75 nH. `characterize_fixture_paths()` measures them
   automatically (calibrations/fixture_paths.json) and subtracts them from the LINK-shorted states:
-  reciprocity -> ~2 %, Lsc -5 %. B2: equalise column/LINK path lengths.
+  reciprocity -> ~2 %, Lsc -5 %. rev C: equalise column/LINK path lengths.
 - [ ] Clamp arms (~13 nH each) and isolated-clamp coupling (~2 pF to GND) still need the operator
   shorting-bar / empty-clamp step. It would also pin where the series path sits, which today limits
   C11/C22/C12 to +-2-3 pF (path L scales the apparent shorted-state C by ~1-2Ls/L).

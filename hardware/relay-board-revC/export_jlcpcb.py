@@ -42,8 +42,15 @@ JLC_BASIC = {
     ("5.1k", "R_0402_1005Metric"): ("0402WGF5101TCE", "C25905"),
     ("10k", "R_0402_1005Metric"): ("0402WGF1002TCE", "C25744"),
     ("1k", "R_0402_1005Metric"): ("0402WGF1001TCE", "C11702"),
+    ("4.7k", "R_0402_1005Metric"): ("0402WGF4701TCE", "C25900"),
+    # 5.1 mm SMD tact switch, 4 pads on the TL3342 pattern; confirm the
+    # land pattern against JLC's matching report before ordering.
+    ("BOOT", "SW_SPST_TL3342"): ("TS-1187A-B-A-B", "C318884"),
+    ("RESET", "SW_SPST_TL3342"): ("TS-1187A-B-A-B", "C318884"),
     ("0R", "R_0805_2012Metric"): ("0805W8F0000T5E", "C17477"),
-    ("PWR", "LED_0603_1608Metric"): ("KT-0603R", "C2286"),
+    # status LEDs: only the red one is a confirmed JLC part; green / amber /
+    # blue are left to the matcher (confirm colour in its report)
+    ("PROG", "LED_0603_1608Metric"): ("KT-0603R", "C2286"),
     # Confirmed by JLC's second matching report (2026-08-31) -- these are
     # the parts its own matcher resolved for this BOM. D2 and U5 are the
     # TECH PUBLIC clones JLC auto-picked (cheapest); swap to the ST/Diodes
@@ -71,6 +78,12 @@ JLC_BASIC = {
     ("TBD62003APG", "SOIC-16_3.9x9.9mm_P1.27mm"):
         ("TBD62003AFG(Z,EL)", "C163227"),
     ("AP2112K-3.3", "SOT-23-5"): ("AP2112K-3.3TRG1", "C23380830"),
+    # rev C additions (numbers confirmed on jlcpcb.com part pages,
+    # 2026-10-11; anything not listed here is left to JLC's matcher)
+    ("10nF", "C_0402_1005Metric"): ("CL05B103KB5NNNC", "C15195"),
+    ("4.7uF", "C_0805_2012Metric"): ("CL21A475KAQNNNE", "C1779"),
+    ("1k 0.1%", "R_0603_1608Metric"): ("RT0603BRD071KL", "C110776"),
+    ("600R@100MHz", "L_0603_1608Metric"): ("GZ1608D601TF", "C1002"),
 }
 
 
@@ -98,9 +111,8 @@ def jlc_comment(value, part):
 
 
 #: Hand-soldered through-hole parts, not for the SMT line.
-HAND_SOLDER = {"J2", "J3", "J4", "J5",   # Phoenix DUT clamps
-               "J6", "J7", "J9",         # BNC jacks
-               "J8"}                     # SWD pin header
+HAND_SOLDER = {f"J{n}" for n in range(10, 18)} | {   # DUT banana jacks
+               "J6", "J7", "J9"}         # BNC jacks (J8 SWD is SMD now: JLC places it)
 
 
 def load_components():
@@ -108,7 +120,9 @@ def load_components():
     components = {}
     for comp in root.find(".//components"):
         reference = comp.get("ref")
-        if reference.startswith("#") or reference in HAND_SOLDER:
+        # TP* are bare copper pads, NT* net ties are copper: nothing to place.
+        if (reference.startswith("#") or reference in HAND_SOLDER
+                or reference.startswith(("TP", "NT"))):
             continue
         value = comp.find("value").text if comp.find("value") is not None else ""
         footprint_node = comp.find("footprint")
